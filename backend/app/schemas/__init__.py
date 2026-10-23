@@ -1,6 +1,9 @@
 from datetime import date, datetime
 from typing import Literal
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from app.core.specialty import canonical_specialty_name
+
+PriorityConditionName = Literal["pcd", "gestante", "lactante"]
 
 
 class LoginRequest(BaseModel):
@@ -15,6 +18,10 @@ class UserResponse(BaseModel):
     permissions: list[str] = []
 
 
+class RegistrationResponse(UserResponse):
+    message: str = "Cadastro concluído. Você já pode entrar."
+
+
 class PatientProfile(BaseModel):
     name: str
     masked_cpf: str
@@ -22,6 +29,10 @@ class PatientProfile(BaseModel):
     birth_date: date | None = None
     email: str
     phone: str | None = None
+    age: int | None = None
+    legal_priority: str = "geral"
+    priority_reason: str = "Sem prioridade legal"
+    priority_conditions: list[dict] = Field(default_factory=list)
 
 
 class TokenResponse(BaseModel):
@@ -58,9 +69,15 @@ class MedicalCareResponse(BaseModel):
     triage_observation: str | None = None
     arrived_at: datetime
     triaged_at: datetime
+    called_at: datetime | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
     care_summary: str | None = None
+
+    @field_validator("specialty", mode="before")
+    @classmethod
+    def canonicalize_specialty(cls, value):
+        return canonical_specialty_name(value) if isinstance(value, str) else value
 
 
 class InternalUserCreate(BaseModel):
@@ -104,6 +121,11 @@ class InternalUserResponse(BaseModel):
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
+    @field_validator("specialty", mode="before")
+    @classmethod
+    def canonicalize_specialty(cls, value):
+        return canonical_specialty_name(value) if isinstance(value, str) else value
+
 
 class DoctorCreate(BaseModel):
     name: str = Field(min_length=3, max_length=80)
@@ -131,11 +153,14 @@ class DoctorResponse(BaseModel):
 class PatientRegistration(BaseModel):
     name: str = Field(min_length=3, max_length=80)
     cpf: str = Field(min_length=11, max_length=32)
+    cns: str | None = None  # legado aceito e deliberadamente ignorado
     birth_date: date
     email: EmailStr
     phone: str = Field(min_length=10, max_length=16)
     password: str = Field(min_length=8, max_length=128)
+    password_confirmation: str = Field(min_length=8, max_length=128)
     priority: str | None = None
+    priority_conditions: list[PriorityConditionName] = Field(default_factory=list)
     guardian_name: str | None = Field(default=None, max_length=120)
     guardian_cpf: str | None = Field(default=None, max_length=32)
     guardian_birth_date: date | None = None
@@ -155,25 +180,17 @@ class PatientRegistration(BaseModel):
         return value.strip().lower() if isinstance(value, str) else value
 
 
-class RecoveryIdentity(BaseModel):
-    document: str = Field(min_length=3, max_length=32)
-    guardian_cpf: str | None = Field(default=None, max_length=32)
-    guardian_email: str | None = Field(default=None, max_length=254)
+class PatientPriorityUpdate(BaseModel):
+    """Paciente pode apenas declarar condições; estado e auditoria são internos."""
+
+    model_config = ConfigDict(extra="forbid")
+    priority: str | None = None
+    priority_conditions: list[PriorityConditionName] = Field(default_factory=list)
 
 
-class PasswordRecoveryVerify(RecoveryIdentity):
-    document: str = Field(min_length=3)
-    code: str = Field(pattern=r"^[0-9]{6}$")
-
-
-class PasswordRecoveryRequest(RecoveryIdentity):
-    document: str = Field(min_length=3, max_length=20)
-
-
-class PasswordReset(BaseModel):
-    recovery_token: str
-    password_confirmation: str = Field(min_length=8, max_length=128)
-    password: str = Field(min_length=8, max_length=128)
+class PriorityValidationInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["confirmada", "rejeitada"]
 
 
 class EmailPasswordRecoveryRequest(BaseModel):
@@ -234,6 +251,11 @@ class AppointmentResponse(BaseModel):
     location: str | None = None
     message: str | None = None
 
+    @field_validator("specialty", mode="before")
+    @classmethod
+    def canonicalize_specialty(cls, value):
+        return canonical_specialty_name(value) if isinstance(value, str) else value
+
 
 class PatientSummary(BaseModel):
     patient: PatientProfile
@@ -244,11 +266,21 @@ class CatalogItem(BaseModel):
     id: int
     name: str
 
+    @field_validator("name", mode="before")
+    @classmethod
+    def canonicalize_name(cls, value):
+        return canonical_specialty_name(value) if isinstance(value, str) else value
+
 
 class AppointmentCreate(BaseModel):
     doctor_id: int
     specialty: str = Field(min_length=3, max_length=80)
     scheduled_at: datetime
+
+    @field_validator("specialty", mode="before")
+    @classmethod
+    def canonicalize_specialty(cls, value):
+        return canonical_specialty_name(value) if isinstance(value, str) else value
 
 
 class RescheduleRequest(BaseModel):
@@ -261,6 +293,11 @@ class AvailableSlot(BaseModel):
     doctor_name: str
     specialty: str
     scheduled_at: datetime
+
+    @field_validator("specialty", mode="before")
+    @classmethod
+    def canonicalize_specialty(cls, value):
+        return canonical_specialty_name(value) if isinstance(value, str) else value
 
 
 class CalendarSlot(AvailableSlot):

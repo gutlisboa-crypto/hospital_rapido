@@ -21,4 +21,4 @@ Esse registro é uma simulação acadêmica de fluxo e não constitui prontuári
 - inicia o atendimento quando há check-in e classificação;
 - conclui o atendimento em andamento.
 
-APIs: `/enfermagem/*` e `/profissional/*`. O alias legado `medico` é normalizado no backend para compatibilidade.
+APIs: `/enfermagem/*` para triagem e `/medico/*` para atendimento. O perfil legado `profissional` é normalizado internamente para `medico`, sem manter rotas duplicadas.

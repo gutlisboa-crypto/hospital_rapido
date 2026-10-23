@@ -1,6 +1,6 @@
 """Verificação de posse do e-mail usado no cadastro de pacientes."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 import hmac
 import logging
 import secrets
@@ -11,6 +11,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.core import clock
 from app.core.config import ALGORITHM, SECRET
 from app.core.security import digest, throttle
 from app.models import EmailVerification, User
@@ -48,6 +49,25 @@ def verification_code_matches(user_id: int, code: str, encoded: str) -> bool:
     return hmac.compare_digest(encoded, hash_verification_code(user_id, code))
 
 
+def issue_verification_code(user: User, db: Session) -> None:
+    """Deliver and persist a new code without ever returning or logging it."""
+    code = generate_verification_code()
+    send_email_verification(user.email, code)
+    now = clock.now_utc_naive()
+    db.execute(
+        update(EmailVerification)
+        .where(EmailVerification.usuario_id == user.id)
+        .values(utilizado=True)
+    )
+    db.add(
+        EmailVerification(
+            usuario_id=user.id,
+            codigo_hash=hash_verification_code(user.id, code),
+            expira_em=now + timedelta(minutes=CODE_TTL_MINUTES),
+        )
+    )
+
+
 def _user_for_email(email: str, db: Session) -> User | None:
     return db.scalar(
         select(User).where(
@@ -80,7 +100,7 @@ def _request_code(
         if pending_user
         else None
     )
-    now = datetime.utcnow()
+    now = clock.now_utc_naive()
     if latest and latest.criado_em > now - timedelta(seconds=RESEND_WAIT_SECONDS):
         retry_after = max(
             1,
@@ -88,16 +108,18 @@ def _request_code(
         )
         return {"message": GENERIC_MESSAGE, "resend_after_seconds": retry_after}
 
-    code = generate_verification_code() if pending_user else None
     try:
         # O mesmo handshake SMTP também é feito para endereços sem conta,
         # reduzindo diferenças observáveis nas respostas públicas.
-        send_email_verification(email if pending_user else None, code)
+        if pending_user:
+            issue_verification_code(pending_user, db)
+        else:
+            send_email_verification(None, None)
     except MailUnavailable as error:
         logger.warning(
             "email_verification_delivery status=failed reason=%s timestamp=%s attempts=%s",
             error.reason,
-            datetime.now(timezone.utc).isoformat(),
+            clock.now_utc().isoformat(),
             attempts,
         )
         raise HTTPException(
@@ -106,18 +128,6 @@ def _request_code(
         ) from None
 
     if pending_user:
-        db.execute(
-            update(EmailVerification)
-            .where(EmailVerification.usuario_id == pending_user.id)
-            .values(utilizado=True)
-        )
-        db.add(
-            EmailVerification(
-                usuario_id=pending_user.id,
-                codigo_hash=hash_verification_code(pending_user.id, code),
-                expira_em=now + timedelta(minutes=CODE_TTL_MINUTES),
-            )
-        )
         db.commit()
     return {"message": GENERIC_MESSAGE, "resend_after_seconds": RESEND_WAIT_SECONDS}
 
@@ -208,7 +218,7 @@ def validate_code(
         400,
         "Código inválido, expirado ou sem tentativas disponíveis. Solicite um novo código.",
     )
-    now = datetime.utcnow()
+    now = clock.now_utc_naive()
     if (
         not row
         or row.utilizado

@@ -1,11 +1,18 @@
 from datetime import datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from test_integration import client, register, login
 from app.core.database import SessionLocal
 from app.core.security import pwd
-from app.models import Appointment, PasswordRecovery, ProfessionalSchedule, User
+from app.models import (
+    Appointment,
+    PasswordRecovery,
+    ProfessionalProfile,
+    ProfessionalSchedule,
+    Specialty,
+    User,
+)
 
 
 def _email_recovery(client, monkeypatch):
@@ -52,8 +59,16 @@ def test_email_recovery_correct_single_use_and_new_login(client, monkeypatch):
         "Senha alterada com sucesso. Faça login com sua nova senha."
     )
     assert client.post("/auth/redefinir-senha", json=body).status_code == 401
+    assert client.post(
+        "/auth/validar-codigo-recuperacao",
+        json={"email": "maria@example.com", "code": code},
+    ).status_code == 400
     assert login(client).status_code == 401
     assert login(client, password="NovaSenha@123").status_code == 200
+    with SessionLocal() as db:
+        user = db.scalar(select(User).where(User.email == "maria@example.com"))
+        assert user.senha_hash != "NovaSenha@123"
+        assert pwd.verify("NovaSenha@123", user.senha_hash)
 
 
 def test_email_recovery_invalid_expired_weak_and_confirmation(client, monkeypatch):
@@ -102,6 +117,83 @@ def test_unknown_email_has_same_response_and_no_recovery(client, monkeypatch):
     unknown = client.post("/auth/esqueci-senha", json={"email": "ninguem@example.com"})
     assert known.status_code == unknown.status_code == 200
     assert known.json() == unknown.json()
+
+
+def test_email_recovery_resend_wait_and_release(client, monkeypatch):
+    import app.routes.recovery as recovery_routes
+
+    sent = []
+    monkeypatch.setattr(
+        recovery_routes,
+        "send_recovery",
+        lambda email, code: sent.append((email, code)) if email else None,
+    )
+    assert register(client).status_code == 201
+
+    first = client.post(
+        "/auth/esqueci-senha", json={"email": "maria@example.com"}
+    )
+    immediate = client.post(
+        "/auth/esqueci-senha", json={"email": "maria@example.com"}
+    )
+    assert first.status_code == immediate.status_code == 200
+    assert first.json() == immediate.json()
+    assert len(sent) == 1
+    with SessionLocal() as db:
+        assert db.scalar(select(func.count(PasswordRecovery.id))) == 1
+        row = db.scalar(select(PasswordRecovery))
+        row.criado_em = datetime.utcnow() - timedelta(seconds=61)
+        db.commit()
+
+    released = client.post(
+        "/auth/esqueci-senha", json={"email": "maria@example.com"}
+    )
+    assert released.status_code == 200
+    assert released.json() == first.json()
+    assert len(sent) == 2
+    with SessionLocal() as db:
+        rows = list(db.scalars(select(PasswordRecovery).order_by(PasswordRecovery.id)))
+        assert len(rows) == 2
+        assert rows[0].utilizado is True
+        assert rows[1].utilizado is False
+
+
+def test_email_recovery_attempt_limit_and_reset_requires_token(client, monkeypatch):
+    code = _email_recovery(client, monkeypatch)
+    wrong = "000000" if code != "000000" else "111111"
+    for _ in range(5):
+        response = client.post(
+            "/auth/validar-codigo-recuperacao",
+            json={"email": "maria@example.com", "code": wrong},
+        )
+        assert response.status_code == 400
+
+    blocked = client.post(
+        "/auth/validar-codigo-recuperacao",
+        json={"email": "maria@example.com", "code": code},
+    )
+    assert blocked.status_code == 429
+    assert "código" not in blocked.text.lower()
+    with SessionLocal() as db:
+        row = db.scalar(select(PasswordRecovery))
+        assert row.tentativas == 5
+        assert row.verificado is False
+
+    assert client.post(
+        "/auth/redefinir-senha",
+        json={
+            "recovery_token": "token-invalido",
+            "new_password": "NovaSenha@123",
+            "confirm_new_password": "NovaSenha@123",
+        },
+    ).status_code == 401
+    assert client.post(
+        "/auth/redefinir-senha",
+        json={
+            "new_password": "NovaSenha@123",
+            "confirm_new_password": "NovaSenha@123",
+        },
+    ).status_code == 422
 
 
 def _next_weekday():
@@ -197,6 +289,16 @@ def test_initial_schedule_has_fourteen_weekdays_including_17h(client):
             perfil="medico",
         )
         db.add(doctor)
+        db.flush()
+        specialty = db.scalar(select(Specialty).where(
+            func.lower(Specialty.nome) == "clínica geral"
+        ))
+        db.add(ProfessionalProfile(
+            usuario_id=doctor.id,
+            registro_profissional="CRM-AGENDA-FUTURA",
+            especialidade_id=specialty.id,
+            ativo=True,
+        ))
         db.commit()
         assert ensure_future_general_schedule(db) == 140
         assert ensure_future_general_schedule(db) == 0

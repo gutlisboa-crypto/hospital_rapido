@@ -3,7 +3,7 @@ setlocal
 set "SEM_PAUSA="
 for %%A in (%*) do if /I "%%~A"=="-SemPausa" set "SEM_PAUSA=1"
 chcp 65001 >nul
-title UBS Rápida - Iniciador oficial
+title UBS Rapida - Iniciador oficial
 cd /d "%~dp0"
 
 echo =====================================================
@@ -17,22 +17,39 @@ echo Frontend: Flutter para Windows, Chrome ou Edge
 echo Modos: padrao Windows ^| -Dispositivo chrome ^| -Dispositivo edge
 echo.
 echo O banco SQLite e os dados existentes serao preservados.
-echo A configuracao SMTP sera verificada antes da inicializacao.
 echo Segredos de configuracao nao serao exibidos.
-echo Credenciais ficticias de demonstracao serao mostradas apos o seed.
-echo As contas ficticias serao verificadas sem duplicacao.
-echo O aplicativo Windows sera recompilado quando o conteudo do frontend mudar.
-echo Use -AtualizarTudo quando quiser atualizar dependencias e recompilar tudo.
+echo O duplo clique atualiza dependencias e recompila o aplicativo antes de abrir.
+echo Em uso avancado, passe -AtualizarTudo para obter o mesmo comportamento.
 echo O primeiro inicio pode demorar durante a preparacao inicial.
 echo.
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\iniciar.ps1" %*
 
-if errorlevel 1 (
-    echo.
-    echo ERRO: nao foi possivel iniciar o UBS Rapida.
-    echo Consulte a mensagem apresentada acima e tente novamente.
+if not exist "%~dp0scripts\iniciar.ps1" (
+    echo [ERRO] O script interno de inicializacao nao foi encontrado.
+    echo Esperado em: %~dp0scripts\iniciar.ps1
     if not defined SEM_PAUSA pause
-    exit /b 1
+    exit /b 2
 )
 
+if "%~1"=="" (
+    echo [MODO] Atualizacao completa automatica.
+    echo [AGUARDE] Verificando dependencias e preparando a versao mais recente...
+    echo.
+    powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\iniciar.ps1" -AtualizarTudo
+) else (
+    echo [MODO] Opcoes informadas: %*
+    echo.
+    powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\iniciar.ps1" %*
+)
+set "CODIGO_SAIDA=%ERRORLEVEL%"
+
+if not "%CODIGO_SAIDA%"=="0" (
+    echo.
+    echo [ERRO] Nao foi possivel iniciar o UBS Rapida.
+    echo Consulte a mensagem apresentada acima e tente novamente.
+    if not defined SEM_PAUSA pause
+    exit /b %CODIGO_SAIDA%
+)
+
+echo.
+echo [OK] Inicializacao concluida pelo botao INICIAR_TUDO.
 exit /b 0

@@ -7,6 +7,7 @@ from app.core.database import SessionLocal
 from app.core.security import pwd
 from app.models import (
     Appointment,
+    PriorityCondition,
     ProfessionalProfile,
     RiskClassification,
     Specialty,
@@ -16,7 +17,7 @@ from app.models import (
 
 def _setup_staff_data():
     with SessionLocal() as db:
-        specialty = Specialty(nome="Clínica Geral", ativo=True)
+        specialty = db.scalar(select(Specialty).where(Specialty.nome == "Clínica Geral"))
         reception = User(
             nome="Recepção Fictícia",
             cpf="98765432100",
@@ -50,7 +51,7 @@ def _setup_staff_data():
             ativo=True,
             e_prioridade="geral",
         )
-        db.add_all([specialty, reception, professional, nurse, patient])
+        db.add_all([reception, professional, nurse, patient])
         db.flush()
         db.add_all([
             ProfessionalProfile(
@@ -128,7 +129,7 @@ def test_nursing_manual_risk_and_complete_workflow(client):
 
     assert (
         client.patch(
-            f"/profissional/agendamentos/{appointment_id}/iniciar-atendimento",
+            f"/medico/atendimentos/{appointment_id}/iniciar",
             headers=professional,
         ).status_code
         == 409
@@ -168,32 +169,34 @@ def test_nursing_manual_risk_and_complete_workflow(client):
         },
     ).status_code == 403
     assert client.patch(
-        f"/profissional/agendamentos/{appointment_id}/iniciar-atendimento",
+        f"/medico/atendimentos/{appointment_id}/iniciar",
         headers=nurse,
     ).status_code == 403
     assert client.get("/admin/users", headers=nurse).status_code == 403
     called = client.patch(
-        f"/profissional/agendamentos/{appointment_id}/chamar",
+        f"/medico/atendimentos/{appointment_id}/chamar",
         headers=professional,
     )
     assert called.status_code == 200
     assert called.json()["called_at"] is not None
     started = client.patch(
-        f"/profissional/agendamentos/{appointment_id}/iniciar-atendimento",
+        f"/medico/atendimentos/{appointment_id}/iniciar",
         headers=professional,
     )
     assert started.status_code == 200
     assert started.json()["started_at"] is not None
     completed = client.patch(
-        f"/profissional/agendamentos/{appointment_id}/concluir-atendimento",
+        f"/medico/atendimentos/{appointment_id}/concluir",
         headers=professional,
+        json={"summary": "Atendimento fictício concluído."},
     )
     assert completed.status_code == 200
     assert completed.json()["completed_at"] is not None
     assert (
         client.patch(
-            f"/profissional/agendamentos/{appointment_id}/concluir-atendimento",
+            f"/medico/atendimentos/{appointment_id}/concluir",
             headers=professional,
+            json={"summary": "Tentativa fictícia repetida."},
         ).status_code
         == 409
     )
@@ -212,6 +215,44 @@ def test_nursing_manual_risk_and_complete_workflow(client):
         assert risk.sinais_vitais == "PA 120/80; temperatura 36,5 °C."
 
 
+def test_only_official_risk_levels_are_accepted_and_reach_medical_queue(client):
+    appointment_id = _setup_staff_data()
+    reception = _login(client, "98765432100", "Recepcao@123")
+    nurse = _login(client, "39053344705", "Enfermagem@123")
+    professional = _login(client, "11144477735", "Profissional@123")
+    assert client.patch(
+        f"/recepcao/agendamentos/{appointment_id}/check-in", headers=reception
+    ).status_code == 200
+
+    path = f"/enfermagem/agendamentos/{appointment_id}/classificacao-risco"
+    for level in ("muito_alto", "alto", "moderado", "baixo"):
+        response = client.patch(
+            path,
+            headers=nurse,
+            json={
+                "level": level,
+                "complaint": "Queixa fictícia para validação.",
+                "vital_signs": "Sinais vitais fictícios estáveis.",
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["risk_classification"] == level
+        medical = client.get("/medico/fila", headers=professional)
+        assert medical.status_code == 200
+        assert medical.json()[0]["risk_classification"] == level
+
+    for invalid in ("vermelho", "laranja", "amarelo", "verde", "qualquer"):
+        assert client.patch(
+            path,
+            headers=nurse,
+            json={
+                "level": invalid,
+                "complaint": "Queixa fictícia para validação.",
+                "vital_signs": "Sinais vitais fictícios estáveis.",
+            },
+        ).status_code == 422
+
+
 def test_queue_orders_risk_legal_priority_and_arrival(client):
     _setup_staff_data()
     now = datetime.now()
@@ -224,8 +265,10 @@ def test_queue_orders_risk_legal_priority_and_arrival(client):
             ("Pessoa Gestante", "gestante", None, "alto", 4),
             ("Pessoa Lactante", "lactante", None, "alto", 5),
             ("Prioridade Geral", "geral", None, "alto", 10),
+            ("Risco Moderado", "geral", None, "moderado", 1),
+            ("Risco Baixo", "geral", None, "baixo", 1),
         ]
-        hours = [7, 8, 9, 11, 13, 14]
+        hours = [7, 8, 9, 11, 13, 14, 15, 16]
         for index, (name, priority, birth, risk_level, minutes) in enumerate(cases):
             patient = User(
                 nome=name,
@@ -239,6 +282,14 @@ def test_queue_orders_risk_legal_priority_and_arrival(client):
             )
             db.add(patient)
             db.flush()
+            if priority in {"pcd", "gestante", "lactante"}:
+                db.add(PriorityCondition(
+                    paciente_id=patient.id,
+                    condicao=priority,
+                    status="confirmada",
+                    validada_por=professional.id,
+                    validada_em=now,
+                ))
             appointment = Appointment(
                 paciente_id=patient.id,
                 medico_id=professional.id,
@@ -249,6 +300,7 @@ def test_queue_orders_risk_legal_priority_and_arrival(client):
                 status="em_triagem",
                 classificacao_risco=risk_level,
                 chegada_em=now - timedelta(minutes=minutes),
+                triagem_em=now,
             )
             db.add(appointment)
             db.flush()
@@ -264,12 +316,12 @@ def test_queue_orders_risk_legal_priority_and_arrival(client):
         db.commit()
 
     professional_headers = _login(client, "11144477735", "Profissional@123")
-    response = client.get("/profissional/fila", headers=professional_headers)
+    response = client.get("/medico/fila", headers=professional_headers)
     assert response.status_code == 200
     rows = response.json()
     assert [row["patient"] for row in rows] == [case[0] for case in cases]
-    assert rows[1]["priority_reason"] == "Pessoa idosa (60 anos ou mais)"
-    assert rows[2]["priority_reason"] == "Pessoa com deficiência (PCD)"
+    assert rows[1]["priority_reason"].startswith("Pessoa idosa —")
+    assert rows[2]["priority_reason"] == "Pessoa com deficiência (PCD) — confirmado presencialmente"
 
 
 def test_health_professional_cannot_use_nursing_routes(client):

@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 import hashlib
 import hmac
 import bcrypt
@@ -9,6 +9,7 @@ from sqlalchemy import delete
 from sqlalchemy.orm import Session
 from app.core.config import SECRET, ALGORITHM
 from app.core.database import get_db
+from app.core import clock
 from app.models import User, RateLimit
 
 
@@ -25,7 +26,7 @@ class PasswordHasher:
 
 pwd = PasswordHasher()
 DUMMY_HASH = pwd.hash("Unrelated-Dummy@123")
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 ROLE_PERMISSIONS = {
     "paciente": ["appointments:own", "profile:own"],
@@ -59,7 +60,7 @@ def make_token(user):
             "purpose": "access",
             "version": user.token_version,
             "role": canonical_role(user.perfil),
-            "exp": datetime.now(timezone.utc) + timedelta(hours=8),
+            "exp": clock.now_utc() + timedelta(hours=8),
         },
         SECRET,
         algorithm=ALGORITHM,
@@ -71,7 +72,7 @@ def make_email_verification_token(user):
         {
             "sub": str(user.id),
             "purpose": "email_verification_setup",
-            "exp": datetime.now(timezone.utc) + timedelta(minutes=30),
+            "exp": clock.now_utc() + timedelta(minutes=30),
         },
         SECRET,
         algorithm=ALGORITHM,
@@ -79,9 +80,16 @@ def make_email_verification_token(user):
 
 
 def current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
     db: Session = Depends(get_db),
 ):
+    unauthorized = HTTPException(
+        401,
+        "Sessão inválida ou expirada",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    if credentials is None or not credentials.credentials.strip():
+        raise unauthorized
     try:
         data = jwt.decode(credentials.credentials, SECRET, algorithms=[ALGORITHM])
         if data.get("purpose") != "access":
@@ -91,7 +99,7 @@ def current_user(
             raise ValueError()
         return user
     except (JWTError, KeyError, ValueError, TypeError):
-        raise HTTPException(401, "Sessão inválida ou expirada")
+        raise unauthorized
 
 
 def require_roles(*roles):
@@ -105,7 +113,7 @@ def require_roles(*roles):
 
 def throttle(db, request: Request, action, identifier, limit=10):
     """Contadores persistentes por IP e documento, sem armazenar identificadores brutos."""
-    now = datetime.utcnow()
+    now = clock.now_utc_naive()
     db.execute(delete(RateLimit).where(RateLimit.expires_at <= now))
     for scope, value, maximum in [
         ("ip", request.client.host if request.client else "local", limit * 5),

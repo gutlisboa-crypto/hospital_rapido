@@ -1,7 +1,9 @@
 part of '../main.dart';
 
 class RecoveryPage extends StatefulWidget {
-  const RecoveryPage({super.key});
+  const RecoveryPage({super.key, this.api, this.logout});
+  final ApiService? api;
+  final Future<void> Function()? logout;
   @override
   State<RecoveryPage> createState() => _RecoveryPageState();
 }
@@ -34,7 +36,8 @@ class _RecoveryPageState extends State<RecoveryPage> {
     if (!resend && !validateAndFocus(form)) return;
     setState(() => busy = true);
     try {
-      final result = await ApiService().forgotPassword(email.text);
+      final result =
+          await (widget.api ?? ApiService()).forgotPassword(email.text);
       if (!mounted) return;
       notice(
           context,
@@ -57,13 +60,13 @@ class _RecoveryPageState extends State<RecoveryPage> {
     if (!validateAndFocus(form)) return;
     setState(() => busy = true);
     try {
-      final api = ApiService();
+      final api = widget.api ?? ApiService();
       if (step == 1) {
         token = await api.verifyRecovery(email.text, code.text);
         if (mounted) setState(() => step = 2);
       } else {
         await api.resetPassword(token!, password.text, confirmation.text);
-        await ApiService.logout();
+        await (widget.logout ?? ApiService.logout)();
         if (!mounted) return;
         notice(context,
             'Senha alterada com sucesso. Faça login com sua nova senha.');
@@ -89,6 +92,7 @@ class _RecoveryPageState extends State<RecoveryPage> {
 
   @override
   Widget build(BuildContext context) => AppPage(
+      showDecorativeWaves: true,
       child: AuthLayout(
           child: Form(
               key: form,
@@ -102,7 +106,7 @@ class _RecoveryPageState extends State<RecoveryPage> {
                     const SizedBox(height: 20),
                     if (step == 0)
                       field(email, 'E-mail cadastrado', Icons.email_outlined,
-                          validator: emailRule),
+                          requiredField: true, validator: emailRule),
                     if (step == 1) ...[
                       Semantics(
                           liveRegion: true,
@@ -110,6 +114,8 @@ class _RecoveryPageState extends State<RecoveryPage> {
                               'Se o e-mail estiver cadastrado, enviaremos um código de verificação.')),
                       const SizedBox(height: 16),
                       field(code, 'Código de verificação', Icons.pin_outlined,
+                          semanticLabel:
+                              'Código de verificação de seis dígitos, obrigatório',
                           number: true,
                           inputFormatters: [
                             FilteringTextInputFormatter.digitsOnly,
@@ -129,6 +135,7 @@ class _RecoveryPageState extends State<RecoveryPage> {
                     ],
                     if (step == 2) ...[
                       field(password, 'Nova senha', Icons.lock_outline,
+                          requiredField: true,
                           secret: hide,
                           validator: passwordRule,
                           suffix: IconButton(
@@ -143,6 +150,7 @@ class _RecoveryPageState extends State<RecoveryPage> {
                               PasswordRules(password: value.text)),
                       field(confirmation, 'Confirmar nova senha',
                           Icons.lock_outline,
+                          requiredField: true,
                           secret: hide,
                           validator: (v) => v == password.text
                               ? null

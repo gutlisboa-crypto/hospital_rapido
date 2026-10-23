@@ -91,132 +91,6 @@ def test_shared_guardian_email_must_match_recovery_destination(client):
 
 
 @pytest.fixture
-def sent(monkeypatch):
-    messages = []
-    monkeypatch.setattr(
-        routes,
-        "send_recovery",
-        lambda email, code: messages.append((email, code)) if email else None,
-    )
-    return messages
-
-
-@pytest.mark.parametrize(
-    "details",
-    [
-        {},
-        {"guardian_cpf": "12345678909", "guardian_email": "ana@example.com"},
-        {"guardian_cpf": "11144477735", "guardian_email": "other@example.com"},
-        {"guardian_cpf": "39053344705", "guardian_email": "other@example.com"},
-    ],
-)
-def test_minor_wrong_identity_is_generic(client, sent, details):
-    assert register(client, **GUARDIAN).status_code == 201
-    with SessionLocal() as db:
-        db.add(
-            Guardian(nome="Outro Adulto", cpf="39053344705", email="other@example.com")
-        )
-        db.commit()
-    r = client.post(
-        "/auth/forgot-password", json={"document": "52998224725", **details}
-    )
-    assert r.status_code == 200 and r.json() == {"message": routes.GENERIC}
-    assert sent == []
-    with SessionLocal() as db:
-        assert db.scalar(select(func.count(PasswordRecovery.id))) == 0
-
-
-def test_minor_multiple_dependents_correct_account(client, sent):
-    assert register(client, **GUARDIAN).status_code == 201
-    assert (
-        register(
-            client, **GUARDIAN, cpf="12345678909", email="second@example.com"
-        ).status_code
-        == 201
-    )
-    identity = {
-        "document": "52998224725",
-        "guardian_cpf": "111.444.777-35",
-        "guardian_email": " ANA@EXAMPLE.COM ",
-    }
-    assert client.post("/auth/forgot-password", json=identity).status_code == 200
-    assert len(sent) == 1 and sent[0][0] == "ana@example.com"
-    code = sent[0][1]
-    assert (
-        client.post(
-            "/auth/verify-recovery-code",
-            json={**identity, "document": "12345678909", "code": code},
-        ).status_code
-        == 400
-    )
-    verified = client.post(
-        "/auth/verify-recovery-code", json={**identity, "code": code}
-    )
-    assert verified.status_code == 200
-    token = verified.json()["recovery_token"]
-    body = {
-        "recovery_token": token,
-        "password": "NovaSenha@123",
-        "password_confirmation": "Diferente@123",
-    }
-    assert client.post("/auth/reset-password", json=body).status_code == 422
-    body["password_confirmation"] = body["password"]
-    assert client.post("/auth/reset-password", json=body).status_code == 200
-    assert login(client).status_code == 401
-    assert login(client, password="NovaSenha@123").status_code == 200
-    assert login(client, document="12345678909").status_code == 200
-    with SessionLocal() as db:
-        assert db.scalar(select(func.count(Guardian.id))) == 1
-        assert db.scalar(select(func.count(PatientGuardian.paciente_id))) == 2
-
-
-def test_new_code_invalidates_previous_and_rate_limit(client, sent):
-    register(client)
-    for _ in range(3):
-        assert (
-            client.post(
-                "/auth/forgot-password", json={"document": "52998224725"}
-            ).status_code
-            == 200
-        )
-    assert (
-        client.post(
-            "/auth/forgot-password", json={"document": "52998224725"}
-        ).status_code
-        == 429
-    )
-    with SessionLocal() as db:
-        rows = list(db.scalars(select(PasswordRecovery).order_by(PasswordRecovery.id)))
-        assert [r.utilizado for r in rows] == [True, True, False]
-        assert all(r.codigo_hash not in [x[1] for x in sent] for r in rows)
-
-
-@pytest.mark.parametrize("document", ["11111111111", "12345678909"])
-def test_unknown_invalid_cpf_generic(client, sent, document):
-    assert client.post("/auth/forgot-password", json={"document": document}).json() == {
-        "message": routes.GENERIC
-    }
-    assert sent == []
-
-
-def test_service_failure_no_false_success_no_code(client, monkeypatch, caplog):
-    register(client)
-
-    def fail(*args):
-        raise mailer.MailUnavailable("SMTP_AUTH_FAILED")
-
-    monkeypatch.setattr(routes, "send_recovery", fail)
-    with caplog.at_level(logging.INFO):
-        a = client.post("/auth/forgot-password", json={"document": "52998224725"})
-        b = client.post("/auth/forgot-password", json={"document": "12345678909"})
-    assert a.status_code == b.status_code == 503 and a.json() == b.json()
-    assert "SMTP_AUTH_FAILED" in caplog.text
-    assert "52998224725" not in caplog.text
-    with SessionLocal() as db:
-        assert db.scalar(select(func.count(PasswordRecovery.id))) == 0
-
-
-@pytest.fixture
 def smtp(monkeypatch):
     for key, value in {
         "SMTP_HOST": "smtp.example.com",
@@ -359,4 +233,24 @@ def test_authentication_failure_logs_only_safe_technical_cause(
     assert error.value.reason == "SMTP_AUTH_FAILED"
     assert "exception_type=SMTPAuthenticationError" in caplog.text
     assert "sensitive provider response" not in caplog.text
+    assert "123456" not in caplog.text
+
+
+def test_advertised_login_keeps_original_535_authentication_error(
+    smtp, caplog
+):
+    _, fake = smtp
+    fake.esmtp_features = {"auth": "LOGIN PLAIN"}
+    fake.auth_login = object()
+
+    def reject_auth(*args, **kwargs):
+        raise smtplib.SMTPAuthenticationError(535, b"provider details")
+
+    fake.auth = reject_auth
+    with caplog.at_level(logging.ERROR), pytest.raises(mailer.MailUnavailable) as error:
+        mailer.send_email_verification("patient@example.com", "123456")
+
+    assert error.value.reason == "SMTP_AUTH_FAILED"
+    assert "exception_type=SMTPAuthenticationError" in caplog.text
+    assert "provider details" not in caplog.text
     assert "123456" not in caplog.text

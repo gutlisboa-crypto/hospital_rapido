@@ -13,10 +13,17 @@ class PatientProfile {
         birthDate =
             v['birth_date'] == null ? null : DateTime.parse(v['birth_date']),
         email = v['email'] as String,
-        phone = v['phone'] as String?;
+        phone = v['phone'] as String?,
+        legalPriority = v['legal_priority'] as String? ?? 'geral',
+        priorityReason =
+            v['priority_reason'] as String? ?? 'Sem prioridade legal',
+        priorityConditions = (v['priority_conditions'] as List? ?? const [])
+            .cast<Map<String, dynamic>>();
   final String name, maskedCpf, email;
   final String? cns, phone;
   final DateTime? birthDate;
+  final String legalPriority, priorityReason;
+  final List<Map<String, dynamic>> priorityConditions;
 }
 
 class PatientSummary {

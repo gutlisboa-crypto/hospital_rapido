@@ -9,6 +9,7 @@ class PatientDashboard extends StatefulWidget {
 
 class _PatientDashboardState extends State<PatientDashboard> {
   late final ApiService api = widget.api ?? ApiService();
+  final ScrollController _bodyScrollController = ScrollController();
   PatientSummary? summary;
   List<Appointment> items = [];
   Timer? refreshTimer;
@@ -28,6 +29,7 @@ class _PatientDashboardState extends State<PatientDashboard> {
   @override
   void dispose() {
     refreshTimer?.cancel();
+    _bodyScrollController.dispose();
     super.dispose();
   }
 
@@ -40,12 +42,26 @@ class _PatientDashboardState extends State<PatientDashboard> {
       final next = values[0] as PatientSummary;
       final all = values[1] as List<Appointment>;
       if (mounted) {
+        String? changedStatus;
+        if (quiet) {
+          final previous = {for (final item in items) item.id: item.status};
+          for (final item in all) {
+            if (previous[item.id] != null && previous[item.id] != item.status) {
+              changedStatus = statusLabel(item.status);
+              break;
+            }
+          }
+        }
         setState(() {
           summary = next;
           items = all;
           error = null;
           loading = false;
         });
+        if (changedStatus != null) {
+          announceImportant(
+              context, 'Status da consulta alterado para $changedStatus');
+        }
       }
     } on ApiException catch (e) {
       if (!mounted) return;
@@ -76,7 +92,29 @@ class _PatientDashboardState extends State<PatientDashboard> {
   }
 
   void openBooking([Appointment? old]) {
-    booking(context, api, old, load);
+    booking(context, api, old, _refreshAfterBooking);
+  }
+
+  Future<void> _refreshAfterBooking() async {
+    while (requesting && mounted) {
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+    }
+    await load();
+    _scrollBodyToStart();
+  }
+
+  void _scrollBodyToStart() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_bodyScrollController.hasClients) {
+        _bodyScrollController.jumpTo(0);
+      }
+    });
+  }
+
+  void _selectPage(int value) {
+    if (page == value) return;
+    setState(() => page = value);
+    _scrollBodyToStart();
   }
 
   void details(Appointment item) {
@@ -94,14 +132,16 @@ class _PatientDashboardState extends State<PatientDashboard> {
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(item.specialty,
+                  Text(specialtyDisplayName(item.specialty),
                       style: Theme.of(context).textTheme.titleLarge),
                   Text(item.professional),
                   Text(showDate(item.scheduledAt)),
                   if (item.location != null) Text(item.location!),
-                  Text('Status: ${statusLabel(item.status)}'),
+                  Semantics(
+                      label: 'Status da consulta: ${statusLabel(item.status)}',
+                      child: Text('Status: ${statusLabel(item.status)}')),
                   const SizedBox(height: 12),
-                  StatusTimeline(status: item.status),
+                  StatusTimeline(status: item.status, compact: true),
                   if (item.status == 'agendado' && !canCancel)
                     const Text('Cancelamento disponível até 24 horas antes.'),
                   if (item.status == 'agendado' && !canReschedule)
@@ -122,14 +162,17 @@ class _PatientDashboardState extends State<PatientDashboard> {
                           : null,
                       child: const Text('Reagendar')),
                 if (item.status == 'agendado')
-                  TextButton(
+                  AppActionButton(
                       onPressed: canCancel && !cancelling.contains(item.id)
                           ? () {
                               Navigator.pop(dialogContext);
                               cancel(item);
                             }
                           : null,
-                      child: const Text('Cancelar')),
+                      icon: Icons.cancel_outlined,
+                      label: 'Cancelar consulta',
+                      semanticLabel: 'Cancelar consulta, ação destrutiva',
+                      destructive: true),
               ],
             ));
   }
@@ -139,16 +182,19 @@ class _PatientDashboardState extends State<PatientDashboard> {
     final confirmed = await showDialog<bool>(
         context: context,
         builder: (c) => AlertDialog(
-              title: const Text('Cancelar consulta?'),
+              title: const Text('Cancelar consulta'),
               content: Text(
-                  'Deseja cancelar ${item.specialty} em ${showDate(item.scheduledAt)}?'),
+                  'Esta ação cancelará o agendamento de ${specialtyDisplayName(item.specialty)} em ${showDate(item.scheduledAt)}.'),
               actions: [
                 TextButton(
                     onPressed: () => Navigator.pop(c, false),
                     child: const Text('Voltar')),
-                FilledButton(
+                AppActionButton(
                     onPressed: () => Navigator.pop(c, true),
-                    child: const Text('Confirmar cancelamento'))
+                    icon: Icons.cancel_outlined,
+                    label: 'Confirmar cancelamento',
+                    semanticLabel: 'Confirmar cancelamento, ação destrutiva',
+                    destructive: true)
               ],
             ));
     if (confirmed != true || !mounted) return;
@@ -175,7 +221,7 @@ class _PatientDashboardState extends State<PatientDashboard> {
     final cancelled = status == 'cancelado' || status == 'falta';
     final color = cancelled ? const Color(0xFFB42318) : green;
     return Semantics(
-        label: 'Status atual: ${statusLabel(status)}',
+        label: 'Status da consulta: ${statusLabel(status)}',
         child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
             decoration: BoxDecoration(
@@ -188,17 +234,19 @@ class _PatientDashboardState extends State<PatientDashboard> {
               Icon(cancelled ? Icons.cancel_outlined : Icons.check_circle,
                   size: 17, color: contrast ? Colors.yellow : color),
               const SizedBox(width: 6),
-              Text(statusLabel(status),
-                  style: TextStyle(
-                      color: contrast ? Colors.white : color,
-                      fontWeight: FontWeight.w700))
+              Flexible(
+                  child: Text(statusLabel(status),
+                      softWrap: true,
+                      style: TextStyle(
+                          color: contrast ? Colors.white : color,
+                          fontWeight: FontWeight.w700)))
             ])));
   }
 
   Widget consultationCard(Appointment item) => Semantics(
       container: true,
       label:
-          '${item.specialty}, ${item.professional}, ${showDate(item.scheduledAt)}, ${statusLabel(item.status)}',
+          'Consulta. Especialidade: ${specialtyDisplayName(item.specialty)}. Profissional: ${item.professional}. Data e horário: ${showDate(item.scheduledAt)}. Status da consulta: ${statusLabel(item.status)}',
       child: Card(
           child: Padding(
               padding: const EdgeInsets.all(20),
@@ -206,7 +254,7 @@ class _PatientDashboardState extends State<PatientDashboard> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     LayoutBuilder(builder: (context, constraints) {
-                      final title = Text(item.specialty,
+                      final title = Text(specialtyDisplayName(item.specialty),
                           style: Theme.of(context)
                               .textTheme
                               .titleLarge
@@ -389,7 +437,7 @@ class _PatientDashboardState extends State<PatientDashboard> {
                             final details = Column(
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
-                                  Text(x.specialty,
+                                  Text(specialtyDisplayName(x.specialty),
                                       style: Theme.of(context)
                                           .textTheme
                                           .titleLarge
@@ -484,8 +532,35 @@ class _PatientDashboardState extends State<PatientDashboard> {
                             width, Icons.email_outlined, 'E-mail', p.email),
                         _profileField(width, Icons.phone_outlined, 'Telefone',
                             formatBrazilianPhone(p.phone)),
+                        _profileField(width, Icons.priority_high, 'Prioridade',
+                            p.priorityReason),
                       ]);
                     }),
+                    if (p.priorityConditions.isNotEmpty) ...[
+                      const SizedBox(height: 16),
+                      ...p.priorityConditions.map((item) {
+                        final status = item['status']?.toString() ?? 'pendente';
+                        final label = switch (item['condition']) {
+                          'pcd' => 'PCD',
+                          'gestante' => 'Gestante',
+                          'lactante' => 'Lactante',
+                          _ => item['condition'].toString(),
+                        };
+                        final message = switch (status) {
+                          'confirmada' => 'Confirmada presencialmente',
+                          'rejeitada' => 'Rejeitada na validação presencial',
+                          _ => 'Aguardando confirmação presencial',
+                        };
+                        return Semantics(
+                            label: '$label. $message',
+                            child: ListTile(
+                                contentPadding: EdgeInsets.zero,
+                                leading:
+                                    const Icon(Icons.verified_user_outlined),
+                                title: Text(label),
+                                subtitle: Text(message)));
+                      }),
+                    ],
                     const SizedBox(height: 24),
                     const Divider(),
                     const SizedBox(height: 12),
@@ -601,7 +676,7 @@ class _PatientDashboardState extends State<PatientDashboard> {
           AppDestination(icon: Icons.person_outline, label: 'Perfil'),
         ],
         selectedIndex: page,
-        onDestinationSelected: (value) => setState(() => page = value),
+        onDestinationSelected: _selectPage,
         primaryAction: !loading && summary != null && error == null
             ? _shellActions()
             : null,
@@ -609,15 +684,30 @@ class _PatientDashboardState extends State<PatientDashboard> {
             ? const Center(child: CircularProgressIndicator())
             : error != null && summary == null
                 ? AppErrorState(message: error!, onAction: load)
-                : SingleChildScrollView(
-                    child: Padding(
-                        padding: const EdgeInsets.only(bottom: 120),
-                        child: switch (page) {
-                          1 => consultationList(),
-                          2 => statusPage(),
-                          3 => profilePage(),
-                          _ => home()
-                        })));
+                : LayoutBuilder(builder: (context, constraints) {
+                    final persistentScrollbar = constraints.maxWidth >= 900;
+                    return Scrollbar(
+                        key: const Key('patient-body-scrollbar'),
+                        controller: _bodyScrollController,
+                        thumbVisibility: persistentScrollbar,
+                        interactive: persistentScrollbar,
+                        thickness: persistentScrollbar ? 8 : 4,
+                        radius: const Radius.circular(8),
+                        child: SingleChildScrollView(
+                            key: const Key('patient-body-scroll-view'),
+                            controller: _bodyScrollController,
+                            padding: EdgeInsets.only(
+                                right: persistentScrollbar
+                                    ? AppSpacing.lg
+                                    : AppSpacing.xs,
+                                bottom: AppSpacing.xl),
+                            child: switch (page) {
+                              1 => consultationList(),
+                              2 => statusPage(),
+                              3 => profilePage(),
+                              _ => home()
+                            }));
+                  }));
   }
 }
 
@@ -648,8 +738,9 @@ String statusLabel(String value) =>
     value;
 
 class StatusTimeline extends StatelessWidget {
-  const StatusTimeline({super.key, required this.status});
+  const StatusTimeline({super.key, required this.status, this.compact = false});
   final String status;
+  final bool compact;
   @override
   Widget build(BuildContext context) {
     const states = [
@@ -689,81 +780,84 @@ class StatusTimeline extends StatelessWidget {
                 ? (contrast ? Colors.black : Colors.white)
                 : colorFor(index)));
 
+    Widget verticalTimeline() => Column(
+            children: List.generate(states.length, (index) {
+          final last = index == states.length - 1;
+          return Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            SizedBox(
+                width: 34,
+                child: Column(children: [
+                  marker(index),
+                  if (!last)
+                    Container(
+                        width: 2,
+                        height: 28,
+                        color:
+                            colorFor(index < current ? index : states.length))
+                ])),
+            const SizedBox(width: 12),
+            Expanded(
+                child: Padding(
+                    padding: const EdgeInsets.only(top: 6, bottom: 24),
+                    child: Text(statusLabel(states[index]),
+                        style: TextStyle(
+                            fontWeight: index == current
+                                ? FontWeight.w800
+                                : FontWeight.w500,
+                            color: contrast || index <= current
+                                ? null
+                                : Colors.black54))))
+          ]);
+        }));
+
     return Semantics(
         container: true,
         label:
             'Fluxo da consulta. Etapa atual: ${statusLabel(states[current])}',
-        child: LayoutBuilder(builder: (context, constraints) {
-          if (constraints.maxWidth < 720) {
-            return Column(
-                children: List.generate(states.length, (index) {
-              final last = index == states.length - 1;
-              return Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    SizedBox(
-                        width: 34,
-                        child: Column(children: [
+        child: compact
+            ? verticalTimeline()
+            : LayoutBuilder(builder: (context, constraints) {
+                if (constraints.maxWidth < 720) {
+                  return verticalTimeline();
+                }
+                return Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: List.generate(states.length, (index) {
+                      final last = index == states.length - 1;
+                      return Expanded(
+                          child: Column(children: [
+                        Row(children: [
+                          if (index > 0)
+                            Expanded(
+                                child: Container(
+                                    height: 2,
+                                    color: colorFor(index <= current
+                                        ? index - 1
+                                        : states.length))),
                           marker(index),
                           if (!last)
-                            Container(
-                                width: 2,
-                                height: 28,
-                                color: colorFor(
-                                    index < current ? index : states.length))
-                        ])),
-                    const SizedBox(width: 12),
-                    Expanded(
-                        child: Padding(
-                            padding: const EdgeInsets.only(top: 6, bottom: 24),
+                            Expanded(
+                                child: Container(
+                                    height: 2,
+                                    color: colorFor(index < current
+                                        ? index
+                                        : states.length))),
+                        ]),
+                        const SizedBox(height: 9),
+                        Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 4),
                             child: Text(statusLabel(states[index]),
+                                textAlign: TextAlign.center,
                                 style: TextStyle(
                                     fontWeight: index == current
                                         ? FontWeight.w800
                                         : FontWeight.w500,
                                     color: contrast || index <= current
                                         ? null
-                                        : Colors.black54))))
-                  ]);
-            }));
-          }
-          return Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: List.generate(states.length, (index) {
-                final last = index == states.length - 1;
-                return Expanded(
-                    child: Column(children: [
-                  Row(children: [
-                    if (index > 0)
-                      Expanded(
-                          child: Container(
-                              height: 2,
-                              color: colorFor(index <= current
-                                  ? index - 1
-                                  : states.length))),
-                    marker(index),
-                    if (!last)
-                      Expanded(
-                          child: Container(
-                              height: 2,
-                              color: colorFor(
-                                  index < current ? index : states.length))),
-                  ]),
-                  const SizedBox(height: 9),
-                  Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 4),
-                      child: Text(statusLabel(states[index]),
-                          textAlign: TextAlign.center,
-                          style: TextStyle(
-                              fontWeight: index == current
-                                  ? FontWeight.w800
-                                  : FontWeight.w500,
-                              color: contrast || index <= current
-                                  ? null
-                                  : Colors.black54)))
-                ]));
+                                        : Colors.black54)))
+                      ]));
+                    }));
               }));
-        }));
   }
 }
 
@@ -1028,7 +1122,7 @@ class _LegacyStaffDashboardState extends State<LegacyStaffDashboard> {
                                 style: const TextStyle(
                                     fontWeight: FontWeight.w800)),
                             Text(
-                                '${item.patientDocument} • ${item.specialty} • ${item.professional}'),
+                                '${item.patientDocument} • ${specialtyDisplayName(item.specialty)} • ${item.professional}'),
                             Text(
                                 'Status: ${statusLabel(item.status)} • Prioridade: ${item.legalPriority}')
                           ]);
@@ -1055,7 +1149,7 @@ class _LegacyStaffDashboardState extends State<LegacyStaffDashboard> {
                         const CircleAvatar(child: Icon(Icons.person_outline)),
                     title: Text(x['patient']?.toString() ?? 'Paciente'),
                     subtitle: Text(
-                        '${x['specialty']} • ${x['professional']}\nPrioridade: ${x['legal_priority'] ?? 'geral'}'),
+                        '${specialtyDisplayName(x['specialty'].toString())} • ${x['professional']}\nPrioridade: ${x['legal_priority'] ?? 'geral'}'),
                     isThreeLine: true,
                     trailing: Text(statusLabel(x['status'].toString()))))
         ]);
@@ -1072,7 +1166,7 @@ class _TriageDialogState extends State<_TriageDialog> {
       complaint = TextEditingController(),
       vitalSigns = TextEditingController(),
       notes = TextEditingController();
-  String risk = 'verde';
+  String? risk;
   @override
   void dispose() {
     complaint.dispose();
@@ -1087,21 +1181,9 @@ class _TriageDialogState extends State<_TriageDialog> {
           content: Form(
               key: form,
               child: Column(mainAxisSize: MainAxisSize.min, children: [
-                DropdownButtonFormField<String>(
-                    initialValue: risk,
-                    decoration: const InputDecoration(
-                        labelText: 'Classificação de risco'),
-                    items: const [
-                      DropdownMenuItem(
-                          value: 'vermelho', child: Text('Vermelho')),
-                      DropdownMenuItem(
-                          value: 'laranja', child: Text('Laranja')),
-                      DropdownMenuItem(
-                          value: 'amarelo', child: Text('Amarelo')),
-                      DropdownMenuItem(value: 'verde', child: Text('Verde')),
-                      DropdownMenuItem(value: 'azul', child: Text('Azul'))
-                    ],
-                    onChanged: (v) => risk = v!),
+                AppRiskSelector(
+                    value: risk,
+                    onChanged: (value) => setState(() => risk = value)),
                 const SizedBox(height: 12),
                 TextFormField(
                     controller: complaint,
@@ -1141,7 +1223,7 @@ class _TriageDialogState extends State<_TriageDialog> {
                       if (notes.text.trim().isNotEmpty)
                         'Observações: ${notes.text.trim()}'
                     ].join('\n');
-                    Navigator.pop(context, [risk, assessment]);
+                    Navigator.pop(context, [risk!, assessment]);
                   }
                 },
                 child: const Text('Salvar triagem'))

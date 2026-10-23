@@ -6,11 +6,15 @@ class EmailVerificationPage extends StatefulWidget {
     required this.email,
     this.sendOnOpen = true,
     this.initialResendSeconds = 0,
+    this.verificationToken,
+    this.api,
   });
 
   final String email;
   final bool sendOnOpen;
   final int initialResendSeconds;
+  final String? verificationToken;
+  final ApiService? api;
 
   @override
   State<EmailVerificationPage> createState() => _EmailVerificationPageState();
@@ -24,10 +28,12 @@ class _EmailVerificationPageState extends State<EmailVerificationPage> {
   bool sending = false, validating = false, verified = false;
   String? message;
   bool messageIsError = false;
+  late String email;
 
   @override
   void initState() {
     super.initState();
+    email = widget.email.trim().toLowerCase();
     if (widget.sendOnOpen) {
       WidgetsBinding.instance.addPostFrameCallback((_) => _send(initial: true));
     } else if (widget.initialResendSeconds > 0) {
@@ -59,8 +65,8 @@ class _EmailVerificationPageState extends State<EmailVerificationPage> {
     });
     try {
       final wait = initial
-          ? await ApiService().requestEmailVerification(widget.email)
-          : await ApiService().resendEmailVerification(widget.email);
+          ? await (widget.api ?? ApiService()).requestEmailVerification(email)
+          : await (widget.api ?? ApiService()).resendEmailVerification(email);
       if (mounted) {
         _startCountdown(wait);
         setState(() {
@@ -87,8 +93,8 @@ class _EmailVerificationPageState extends State<EmailVerificationPage> {
       message = null;
     });
     try {
-      final result = await ApiService()
-          .validateEmailVerification(widget.email, code.text.trim());
+      final result = await (widget.api ?? ApiService())
+          .validateEmailVerification(email, code.text.trim());
       if (mounted) {
         timer?.cancel();
         setState(() {
@@ -109,8 +115,65 @@ class _EmailVerificationPageState extends State<EmailVerificationPage> {
     }
   }
 
-  void _correctEmail() {
-    Navigator.pop(context);
+  Future<void> _correctEmail() async {
+    if (widget.verificationToken == null) {
+      Navigator.pop(context);
+      return;
+    }
+    final controller = TextEditingController(text: email);
+    final key = GlobalKey<FormState>();
+    final updated = await showDialog<String>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+              title: const Text('Corrigir e-mail'),
+              content: Form(
+                  key: key,
+                  child: TextFormField(
+                    controller: controller,
+                    autofocus: true,
+                    keyboardType: TextInputType.emailAddress,
+                    validator: emailRule,
+                    decoration: const InputDecoration(labelText: 'Novo e-mail'),
+                  )),
+              actions: [
+                TextButton(
+                    onPressed: () => Navigator.pop(dialogContext),
+                    child: const Text('Fechar')),
+                FilledButton(
+                    onPressed: () {
+                      if (key.currentState?.validate() ?? false) {
+                        Navigator.pop(dialogContext, controller.text.trim());
+                      }
+                    },
+                    child: const Text('Salvar e reenviar')),
+              ],
+            ));
+    controller.dispose();
+    if (updated == null || !mounted) return;
+    setState(() {
+      sending = true;
+      message = null;
+    });
+    try {
+      await (widget.api ?? ApiService())
+          .correctRegistrationEmail(widget.verificationToken!, updated);
+      if (!mounted) return;
+      setState(() {
+        email = updated.toLowerCase();
+        remaining = 0;
+        code.clear();
+        sending = false;
+      });
+      await _send(initial: true);
+    } on ApiException catch (error) {
+      if (mounted) {
+        setState(() {
+          sending = false;
+          messageIsError = true;
+          message = error.message;
+        });
+      }
+    }
   }
 
   @override
@@ -139,7 +202,7 @@ class _EmailVerificationPageState extends State<EmailVerificationPage> {
                     Text(
                         verified
                             ? 'Seu cadastro está pronto. Você já pode entrar com CPF e senha.'
-                            : 'Enviamos um código de 6 dígitos para ${widget.email}. Ele vale por 10 minutos.',
+                            : 'Enviamos um código de 6 dígitos para $email. Ele vale por 10 minutos.',
                         textAlign: TextAlign.center),
                     const SizedBox(height: 20),
                     if (!verified)

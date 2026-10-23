@@ -42,6 +42,24 @@ void main() {
   testWidgets('cadastro não apresenta CNS', (tester) async {
     await tester.pumpWidget(const MaterialApp(home: RegisterPage()));
     expect(find.textContaining('CNS'), findsNothing);
+    expect(find.byType(WaveBackground), findsOneWidget);
+  });
+  testWidgets('ondas ficam restritas às telas de acesso', (tester) async {
+    await tester.pumpWidget(const UbsApp(home: RecoveryPage()));
+    expect(find.byType(WaveBackground), findsOneWidget);
+
+    await tester.pumpWidget(const UbsApp(
+        home: EmailVerificationPage(
+            email: 'usuario.ficticio@example.invalid', sendOnOpen: false)));
+    expect(find.byType(WaveBackground), findsNothing);
+
+    await tester.pumpWidget(const UbsApp(
+        home: ResponsiveAppShell(
+            title: 'Área interna',
+            wideNavigationMode: WideNavigationMode.contentOnly,
+            body: SizedBox())));
+    expect(find.byType(WaveBackground), findsNothing);
+    expect(tester.takeException(), isNull);
   });
   testWidgets('fonte global, reset e contraste persistem na navegação',
       (tester) async {

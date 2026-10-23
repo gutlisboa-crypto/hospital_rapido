@@ -1,21 +1,55 @@
 part of '../main.dart';
 
-enum AdminSection {
-  overview('Visão geral', Icons.dashboard_outlined),
-  agenda('Agenda do dia', Icons.today_outlined),
-  appointments('Agendamentos', Icons.event_note_outlined),
-  checkin('Confirmar chegada', Icons.how_to_reg_outlined),
-  queue('Fila de atendimento', Icons.groups_outlined),
-  grids('Grades e horários', Icons.calendar_month_outlined),
-  specialties('Especialidades', Icons.medical_information_outlined),
-  professionals('Profissionais', Icons.medical_services_outlined),
-  doctors('Médicos', Icons.health_and_safety_outlined),
-  users('Usuários internos', Icons.manage_accounts_outlined),
-  history('Histórico', Icons.history_outlined),
-  settings('Configurações', Icons.settings_outlined);
+enum AdminArea {
+  attendance('Atendimento', 'Rotina e fluxo dos pacientes.',
+      Icons.monitor_heart_outlined, Color(0xFF0F6B3A)),
+  schedule('Agenda e oferta', 'Consultas, horários e serviços.',
+      Icons.calendar_month_outlined, Color(0xFF005A9C)),
+  people('Pessoas e acessos', 'Profissionais e contas do sistema.',
+      Icons.groups_outlined, Color(0xFF6A3DA6)),
+  governance('Governança', 'Atividades e configurações.', Icons.policy_outlined,
+      Color(0xFF9A4A00));
 
-  const AdminSection(this.label, this.icon);
+  const AdminArea(this.label, this.description, this.icon, this.color);
   final String label;
+  final String description;
+  final IconData icon;
+  final Color color;
+}
+
+enum AdminSection {
+  overview(AdminArea.attendance, 'Visão geral',
+      'Indicadores das consultas de hoje.', Icons.dashboard_outlined),
+  agenda(AdminArea.schedule, 'Agenda do dia',
+      'Consulte consultas por data e filtros.', Icons.today_outlined),
+  appointments(AdminArea.schedule, 'Agendamentos',
+      'Veja e gerencie os agendamentos.', Icons.event_note_outlined),
+  checkin(AdminArea.attendance, 'Confirmar chegada',
+      'Registre check-in ou falta.', Icons.how_to_reg_outlined),
+  queue(AdminArea.attendance, 'Fila de atendimento',
+      'Acompanhe pacientes aguardando.', Icons.groups_outlined),
+  grids(AdminArea.schedule, 'Grades e horários',
+      'Configure períodos, vagas e intervalos.', Icons.view_week_outlined),
+  specialties(AdminArea.schedule, 'Especialidades',
+      'Gerencie os serviços oferecidos.', Icons.local_hospital_outlined),
+  professionals(AdminArea.people, 'Profissionais',
+      'Gerencie a equipe multiprofissional.', Icons.badge_outlined),
+  doctors(
+      AdminArea.people,
+      'Médicos',
+      'Gerencie contas e especialidades médicas.',
+      Icons.health_and_safety_outlined),
+  users(AdminArea.people, 'Usuários internos', 'Controle contas e permissões.',
+      Icons.manage_accounts_outlined),
+  history(AdminArea.governance, 'Histórico',
+      'Consulte alterações e validações.', Icons.history_outlined),
+  settings(AdminArea.governance, 'Configurações',
+      'Ajuste preferências administrativas.', Icons.settings_outlined);
+
+  const AdminSection(this.area, this.label, this.description, this.icon);
+  final AdminArea area;
+  final String label;
+  final String description;
   final IconData icon;
 }
 
@@ -37,11 +71,17 @@ class _AdminDashboardState extends State<AdminDashboard> {
       professionals = [],
       queue = [],
       audit = [],
+      priorityValidations = [],
       grids = [];
   bool loading = true;
+  bool queueFiltering = false;
   String? error;
   Timer? refreshTimer;
   final specialtySearch = TextEditingController();
+  final queueSearch = TextEditingController();
+  DateTime queueDay = DateTime.now();
+  String? queueSpecialty, queueStatus, queueRisk;
+  int? queueProfessionalId;
 
   @override
   void initState() {
@@ -56,16 +96,50 @@ class _AdminDashboardState extends State<AdminDashboard> {
   void dispose() {
     refreshTimer?.cancel();
     specialtySearch.dispose();
+    queueSearch.dispose();
     super.dispose();
   }
 
+  Future<List<Map<String, dynamic>>> _fetchQueue() => api.queue(
+      day: queueDay,
+      specialty: queueSpecialty,
+      professionalId: queueProfessionalId,
+      status: queueStatus,
+      risk: queueRisk,
+      patient: queueSearch.text);
+
   Future<void> _refreshQueue() async {
     try {
-      final latest = await api.queue();
+      final latest = await _fetchQueue();
       if (mounted && section == AdminSection.queue) {
         setState(() => queue = latest);
       }
     } on ApiException catch (_) {}
+  }
+
+  Future<void> _applyQueueFilters() async {
+    if (queueFiltering) return;
+    setState(() => queueFiltering = true);
+    try {
+      final latest = await _fetchQueue();
+      if (mounted) setState(() => queue = latest);
+    } on ApiException catch (e) {
+      if (mounted) notice(context, e.message);
+    } finally {
+      if (mounted) setState(() => queueFiltering = false);
+    }
+  }
+
+  Future<void> _clearQueueFilters() async {
+    setState(() {
+      queueDay = DateTime.now();
+      queueSpecialty = null;
+      queueProfessionalId = null;
+      queueStatus = null;
+      queueRisk = null;
+      queueSearch.clear();
+    });
+    await _applyQueueFilters();
   }
 
   Future<void> load() async {
@@ -90,7 +164,11 @@ class _AdminDashboardState extends State<AdminDashboard> {
           specialties = values[1] as List<Map<String, dynamic>>;
           professionals = values[2] as List<Map<String, dynamic>>;
         case AdminSection.queue:
-          queue = await api.queue();
+          final values = await Future.wait(
+              [_fetchQueue(), api.adminSpecialties(), api.allProfessionals()]);
+          queue = values[0];
+          specialties = values[1];
+          professionals = values[2];
         case AdminSection.users:
         case AdminSection.professionals:
           users = await api.internalUsers(
@@ -107,6 +185,12 @@ class _AdminDashboardState extends State<AdminDashboard> {
           specialties = values[1];
         case AdminSection.history:
           audit = await api.auditHistory();
+          try {
+            priorityValidations = await api.priorityValidations();
+          } on ApiException {
+            // Mantém compatibilidade com backends anteriores durante atualização.
+            priorityValidations = [];
+          }
         case AdminSection.settings:
           break;
       }
@@ -132,11 +216,12 @@ class _AdminDashboardState extends State<AdminDashboard> {
 
   @override
   Widget build(BuildContext context) => ResponsiveAppShell(
-      title: 'Painel Administrativo • Administrador',
+      title: 'Administração',
       subtitle: ApiService.session?.name ?? 'Administrador',
       destinations: [
         for (final item in AdminSection.values)
-          AppDestination(icon: item.icon, label: item.label)
+          AppDestination(
+              icon: item.icon, label: item.label, color: item.area.color)
       ],
       selectedIndex: AdminSection.values.indexOf(section),
       onDestinationSelected: (index) => select(AdminSection.values[index]),
@@ -150,11 +235,37 @@ class _AdminDashboardState extends State<AdminDashboard> {
             icon: const Icon(Icons.logout),
             label: const Text('Sair')),
       ]),
-      body: Card(
-          key: const Key('admin-module-content'),
-          child: Padding(
-              padding: const EdgeInsets.all(AppSpacing.md),
-              child: _content())));
+      body: Semantics(
+          container: true,
+          explicitChildNodes: true,
+          label: 'Administração: ${section.label}',
+          child:
+              Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            Semantics(
+              key: const Key('admin-breadcrumb'),
+              label: 'Localização: ${section.area.label}, ${section.label}',
+              child: Row(children: [
+                Icon(section.area.icon,
+                    size: 18, color: Theme.of(context).colorScheme.primary),
+                const SizedBox(width: AppSpacing.xs),
+                Flexible(
+                  child: Text('${section.area.label}  ›  ${section.label}',
+                      style: Theme.of(context)
+                          .textTheme
+                          .labelLarge
+                          ?.copyWith(fontWeight: FontWeight.w700)),
+                ),
+              ]),
+            ),
+            const SizedBox(height: AppSpacing.sm),
+            Expanded(
+              child: Card(
+                  key: const Key('admin-module-content'),
+                  child: Padding(
+                      padding: const EdgeInsets.all(AppSpacing.md),
+                      child: _content())),
+            ),
+          ])));
 
   Widget _content() {
     if (loading) return const Center(child: CircularProgressIndicator());
@@ -212,7 +323,7 @@ class _AdminDashboardState extends State<AdminDashboard> {
       ('Vagas disponíveis', s.available, Icons.event_seat_outlined, green),
     ];
     return ListView(children: [
-      _title('Visão geral', 'Indicadores reais das consultas de hoje.'),
+      _title('Visão do dia', 'Indicadores reais das consultas de hoje.'),
       const SizedBox(height: 20),
       LayoutBuilder(builder: (_, c) {
         final width = c.maxWidth >= 900
@@ -258,30 +369,326 @@ class _AdminDashboardState extends State<AdminDashboard> {
           ])));
 
   Widget _agenda() => _AgendaAdminView(
+      key: ValueKey(section),
       api: api,
+      title: section.label,
       initial: appointments,
       specialties: specialties,
       professionals: professionals,
       checkinOnly: section == AdminSection.checkin,
       onChanged: load);
 
-  Widget _queue() => ListView(children: [
+  Widget _queue() =>
+      ListView(padding: const EdgeInsets.only(bottom: 24), children: [
         _title('Fila de atendimento',
             'Ordenada pelo backend por risco, prioridade legal e chegada.'),
-        const SizedBox(height: 16),
-        if (queue.isEmpty)
-          const _EmptyState('Nenhum paciente aguardando atendimento.'),
-        for (final item in queue)
-          Card(
-              child: ListTile(
-            leading: CircleAvatar(child: Text('${item['position'] ?? '-'}')),
-            title: Text(item['patient']?.toString() ?? 'Paciente'),
-            subtitle: Text(
-                '${item['specialty']} • ${item['professional']}\nChegada: ${item['arrived_at'] == null ? '-' : item['arrived_at'].toString().substring(11, 16)} • Prioridade: ${item['legal_priority'] ?? 'geral'} • Risco: ${item['risk_classification'] ?? 'não classificado'}'),
-            isThreeLine: true,
-            trailing: Text(statusLabel(item['status']?.toString() ?? '')),
-          ))
+        const SizedBox(height: AppSpacing.md),
+        Semantics(
+          key: const Key('admin-queue-filter-region'),
+          container: true,
+          label: 'Filtros da fila de atendimento',
+          child: AppSurfaceCard(
+            child: LayoutBuilder(builder: (context, constraints) {
+              final fieldWidth = responsiveFilterWidth(constraints.maxWidth);
+              return Wrap(
+                spacing: AppSpacing.sm,
+                runSpacing: AppSpacing.sm,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  SizedBox(
+                    width: fieldWidth,
+                    child: Semantics(
+                      textField: true,
+                      label: 'Buscar paciente na fila por nome ou CPF',
+                      child: TextField(
+                        key: const Key('admin-queue-search'),
+                        controller: queueSearch,
+                        textInputAction: TextInputAction.search,
+                        onSubmitted: (_) => _applyQueueFilters(),
+                        decoration: InputDecoration(
+                          labelText: 'Paciente',
+                          hintText: 'Nome ou CPF',
+                          prefixIcon:
+                              const ExcludeSemantics(child: Icon(Icons.search)),
+                          suffixIcon: IconButton(
+                            tooltip: 'Buscar paciente',
+                            onPressed:
+                                queueFiltering ? null : _applyQueueFilters,
+                            icon: const Icon(Icons.arrow_forward),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                  SizedBox(
+                    width: fieldWidth,
+                    child: DropdownButtonFormField<String>(
+                      key: ValueKey('admin-queue-specialty-$queueSpecialty'),
+                      initialValue: queueSpecialty,
+                      isExpanded: true,
+                      itemHeight: null,
+                      decoration:
+                          const InputDecoration(labelText: 'Especialidade'),
+                      items: [
+                        const DropdownMenuItem(
+                            value: null, child: Text('Todas')),
+                        for (final value in specialties)
+                          DropdownMenuItem(
+                            value: value['name'].toString(),
+                            child: Text(
+                                specialtyDisplayName(value['name'].toString()),
+                                maxLines: 2,
+                                softWrap: true),
+                          ),
+                      ],
+                      onChanged: queueFiltering
+                          ? null
+                          : (value) {
+                              setState(() => queueSpecialty = value);
+                              _applyQueueFilters();
+                            },
+                    ),
+                  ),
+                  SizedBox(
+                    width: fieldWidth,
+                    child: DropdownButtonFormField<int>(
+                      key: ValueKey(
+                          'admin-queue-professional-$queueProfessionalId'),
+                      initialValue: queueProfessionalId,
+                      isExpanded: true,
+                      itemHeight: null,
+                      decoration:
+                          const InputDecoration(labelText: 'Profissional'),
+                      items: [
+                        const DropdownMenuItem(
+                            value: null, child: Text('Todos')),
+                        for (final value in professionals)
+                          DropdownMenuItem(
+                            value: value['id'] as int,
+                            child: Text(value['name'].toString(),
+                                maxLines: 2, softWrap: true),
+                          ),
+                      ],
+                      onChanged: queueFiltering
+                          ? null
+                          : (value) {
+                              setState(() => queueProfessionalId = value);
+                              _applyQueueFilters();
+                            },
+                    ),
+                  ),
+                  SizedBox(
+                    width: fieldWidth,
+                    child: DropdownButtonFormField<String>(
+                      key: ValueKey('admin-queue-status-$queueStatus'),
+                      initialValue: queueStatus,
+                      isExpanded: true,
+                      decoration: const InputDecoration(labelText: 'Status'),
+                      items: const [
+                        DropdownMenuItem(value: null, child: Text('Todos')),
+                        DropdownMenuItem(
+                            value: 'em_espera', child: Text('Em espera')),
+                        DropdownMenuItem(
+                            value: 'em_triagem', child: Text('Em triagem')),
+                        DropdownMenuItem(
+                            value: 'em_atendimento',
+                            child: Text('Em atendimento')),
+                      ],
+                      onChanged: queueFiltering
+                          ? null
+                          : (value) {
+                              setState(() => queueStatus = value);
+                              _applyQueueFilters();
+                            },
+                    ),
+                  ),
+                  SizedBox(
+                    width: fieldWidth,
+                    child: DropdownButtonFormField<String>(
+                      key: ValueKey('admin-queue-risk-$queueRisk'),
+                      initialValue: queueRisk,
+                      isExpanded: true,
+                      itemHeight: null,
+                      decoration: const InputDecoration(
+                          labelText: 'Classificação de risco'),
+                      items: [
+                        const DropdownMenuItem(
+                            value: null, child: Text('Todas')),
+                        for (final item in RiskClassification.options)
+                          DropdownMenuItem(
+                            value: item.$1,
+                            child: AppRiskFilterItem(risk: item.$1),
+                          ),
+                      ],
+                      onChanged: queueFiltering
+                          ? null
+                          : (value) {
+                              setState(() => queueRisk = value);
+                              _applyQueueFilters();
+                            },
+                    ),
+                  ),
+                  SizedBox(
+                    width: fieldWidth,
+                    child: OutlinedButton.icon(
+                      key: const Key('admin-queue-date'),
+                      onPressed: queueFiltering
+                          ? null
+                          : () async {
+                              final picked = await showDatePicker(
+                                context: context,
+                                initialDate: queueDay,
+                                firstDate: DateTime(2020),
+                                lastDate: DateTime.now()
+                                    .add(const Duration(days: 730)),
+                              );
+                              if (picked != null) {
+                                setState(() => queueDay = picked);
+                                await _applyQueueFilters();
+                              }
+                            },
+                      icon: const Icon(Icons.calendar_today_outlined),
+                      label: Text('Data: ${showOnlyDate(queueDay)}'),
+                    ),
+                  ),
+                  SizedBox(
+                    width: fieldWidth,
+                    child: OutlinedButton.icon(
+                      key: const Key('admin-queue-clear-filters'),
+                      onPressed: queueFiltering ? null : _clearQueueFilters,
+                      icon: const Icon(Icons.filter_alt_off_outlined),
+                      label: const Text('Limpar filtros'),
+                    ),
+                  ),
+                ],
+              );
+            }),
+          ),
+        ),
+        if (queueFiltering) ...[
+          const SizedBox(height: AppSpacing.sm),
+          const LinearProgressIndicator(
+              semanticsLabel: 'Atualizando fila com os filtros selecionados'),
+        ],
+        const SizedBox(height: AppSpacing.md),
+        if (!queueFiltering && queue.isEmpty)
+          const _EmptyState(
+              'Nenhum paciente corresponde aos filtros selecionados.'),
+        for (final item in queue) ...[
+          _queueCard(item),
+          const SizedBox(height: AppSpacing.sm),
+        ],
       ]);
+
+  Widget _queueCard(Map<String, dynamic> item) {
+    final position = '${item['position'] ?? '-'}';
+    final patient = item['patient']?.toString() ?? 'Paciente';
+    final specialty = specialtyDisplayName(item['specialty']?.toString() ?? '');
+    final professional = item['professional']?.toString() ?? '-';
+    final priority = item['legal_priority']?.toString() ?? 'geral';
+    final status = item['status']?.toString() ?? '';
+    final statusText = statusLabel(status);
+    final arrival = _queueArrival(item['arrived_at']);
+    final statusBadge = AppStatusBadge(
+      key: Key('admin-queue-status-$position'),
+      label: statusText,
+      tone: statusToneFor(status),
+      semanticLabel: 'Status atual: $statusText',
+    );
+
+    return Card(
+      key: Key('admin-queue-card-$position'),
+      child: Padding(
+        padding: const EdgeInsets.all(AppSpacing.md),
+        child: LayoutBuilder(builder: (context, constraints) {
+          final positionBadge = Semantics(
+            label: 'Posição $position na fila',
+            excludeSemantics: true,
+            child: CircleAvatar(
+              radius: 24,
+              backgroundColor: Theme.of(context).colorScheme.primaryContainer,
+              foregroundColor: Theme.of(context).colorScheme.onPrimaryContainer,
+              child: Text(position,
+                  style: Theme.of(context)
+                      .textTheme
+                      .titleMedium
+                      ?.copyWith(fontWeight: FontWeight.w800)),
+            ),
+          );
+          final details = Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(patient,
+                  style: Theme.of(context)
+                      .textTheme
+                      .titleMedium
+                      ?.copyWith(fontWeight: FontWeight.w800)),
+              const SizedBox(height: AppSpacing.xs),
+              Text('$specialty • $professional',
+                  softWrap: true, style: Theme.of(context).textTheme.bodyLarge),
+              const SizedBox(height: AppSpacing.sm),
+              Wrap(
+                spacing: AppSpacing.lg,
+                runSpacing: AppSpacing.xs,
+                children: [
+                  _queueMetadata(Icons.schedule_outlined, 'Chegada: $arrival'),
+                  _queueMetadata(Icons.accessible_forward_outlined,
+                      'Prioridade: $priority'),
+                ],
+              ),
+              const SizedBox(height: AppSpacing.sm),
+              AppRiskIndicator(risk: item['risk_classification']?.toString()),
+            ],
+          );
+
+          if (constraints.maxWidth < 760) {
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  positionBadge,
+                  const SizedBox(width: AppSpacing.md),
+                  Expanded(child: details),
+                ]),
+                const SizedBox(height: AppSpacing.md),
+                Align(alignment: Alignment.centerLeft, child: statusBadge),
+              ],
+            );
+          }
+
+          return Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              positionBadge,
+              const SizedBox(width: AppSpacing.md),
+              Expanded(child: details),
+              const SizedBox(width: AppSpacing.lg),
+              SizedBox(
+                  width: 190,
+                  child: Align(
+                      alignment: Alignment.centerLeft, child: statusBadge)),
+            ],
+          );
+        }),
+      ),
+    );
+  }
+
+  Widget _queueMetadata(IconData icon, String text) => Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 18),
+          const SizedBox(width: AppSpacing.xs),
+          Flexible(child: Text(text)),
+        ],
+      );
+
+  String _queueArrival(Object? value) {
+    if (value == null) return '-';
+    final parsed = DateTime.tryParse(value.toString());
+    if (parsed == null) return value.toString();
+    return '${parsed.hour.toString().padLeft(2, '0')}:${parsed.minute.toString().padLeft(2, '0')}';
+  }
 
   Widget _users() => _InternalUsersView(
       api: api,
@@ -307,15 +714,19 @@ class _AdminDashboardState extends State<AdminDashboard> {
               icon: const Icon(Icons.add),
               label: const Text('Nova especialidade'))),
       const SizedBox(height: 16),
-      TextField(
-          key: const Key('specialty-search-field'),
-          controller: specialtySearch,
-          onChanged: (_) => setState(() {}),
-          decoration: const InputDecoration(
-              labelText: 'Pesquisar especialidades',
-              hintText: 'Digite o nome da especialidade',
-              prefixIcon: Icon(Icons.search),
-              suffixIcon: Icon(Icons.manage_search))),
+      Semantics(
+          textField: true,
+          label: 'Pesquisar especialidades',
+          child: TextField(
+              key: const Key('specialty-search-field'),
+              controller: specialtySearch,
+              onChanged: (_) => setState(() {}),
+              decoration: const InputDecoration(
+                  labelText: 'Pesquisar especialidades',
+                  hintText: 'Digite o nome da especialidade',
+                  prefixIcon: ExcludeSemantics(child: Icon(Icons.search)),
+                  suffixIcon:
+                      ExcludeSemantics(child: Icon(Icons.manage_search))))),
       const SizedBox(height: 16),
       if (specialties.isEmpty)
         const _EmptyState('Nenhuma especialidade cadastrada.')
@@ -353,7 +764,8 @@ class _AdminDashboardState extends State<AdminDashboard> {
     ]);
     return Semantics(
         container: true,
-        label: 'Especialidade ${item['name']}, ${active ? 'ativa' : 'inativa'}',
+        label:
+            'Especialidade ${specialtyDisplayName(item['name'].toString())}, ${active ? 'ativa' : 'inativa'}',
         child: Card(
             child: Padding(
                 padding: const EdgeInsets.all(AppSpacing.md),
@@ -365,9 +777,9 @@ class _AdminDashboardState extends State<AdminDashboard> {
                         child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                          Text(item['name'].toString(),
+                          Text(specialtyDisplayName(item['name'].toString()),
                               style: Theme.of(context).textTheme.titleMedium,
-                              overflow: TextOverflow.ellipsis,
+                              softWrap: true,
                               maxLines: 2),
                           const SizedBox(height: 6),
                           details
@@ -426,8 +838,27 @@ class _AdminDashboardState extends State<AdminDashboard> {
 
   Widget _history() => ListView(children: [
         _title('Histórico e auditoria',
-            'Ações administrativas registradas sem informações sensíveis.'),
+            'Validações presenciais e ações administrativas, sem permitir alterar a idade.'),
         const SizedBox(height: 16),
+        if (priorityValidations.isNotEmpty) ...[
+          Text('Validações de prioridade',
+              style: Theme.of(context).textTheme.titleLarge),
+          const SizedBox(height: 8),
+          for (final item in priorityValidations)
+            Card(
+                child: ListTile(
+                    leading: const Icon(Icons.verified_user_outlined),
+                    title: Text('${item['patient']} • ${item['condition']}'),
+                    subtitle: Text([
+                      'Estado: ${item['status']}',
+                      if (item['validated_by'] != null)
+                        'Responsável: ${item['validated_by']}',
+                      if (item['validated_at'] != null)
+                        'Data: ${showDate(DateTime.parse(item['validated_at']))}',
+                      'Eventos no histórico: ${(item['history'] as List? ?? const []).length}'
+                    ].join('\n')))),
+          const SizedBox(height: 16),
+        ],
         if (audit.isEmpty)
           const _EmptyState('Nenhuma ação administrativa registrada.'),
         for (final item in audit)
@@ -705,13 +1136,16 @@ class _EmptyState extends StatelessWidget {
 
 class _AgendaAdminView extends StatefulWidget {
   const _AgendaAdminView(
-      {required this.api,
+      {super.key,
+      required this.api,
+      required this.title,
       required this.initial,
       required this.specialties,
       required this.professionals,
       required this.checkinOnly,
       required this.onChanged});
   final ApiService api;
+  final String title;
   final List<AdminAppointment> initial;
   final List<Map<String, dynamic>> specialties, professionals;
   final bool checkinOnly;
@@ -723,7 +1157,7 @@ class _AgendaAdminView extends StatefulWidget {
 class _AgendaAdminViewState extends State<_AgendaAdminView> {
   late List<AdminAppointment> items = widget.initial;
   final search = TextEditingController();
-  String? status, specialty;
+  String? status, specialty, risk;
   int? professionalId;
   DateTime day = DateTime.now();
   bool busy = false;
@@ -742,12 +1176,26 @@ class _AgendaAdminViewState extends State<_AgendaAdminView> {
           specialty: specialty,
           professionalId: professionalId,
           status: widget.checkinOnly ? 'agendado' : status,
+          risk: widget.checkinOnly ? null : risk,
           patient: search.text);
     } on ApiException catch (e) {
       if (mounted) notice(context, e.message);
     } finally {
       if (mounted) setState(() => busy = false);
     }
+  }
+
+  Future<void> clearFilters() async {
+    if (busy) return;
+    setState(() {
+      day = DateTime.now();
+      status = null;
+      specialty = null;
+      professionalId = null;
+      risk = null;
+      search.clear();
+    });
+    await filter();
   }
 
   Future<bool> _confirm(String title, String message, String action) async =>
@@ -806,11 +1254,15 @@ class _AgendaAdminViewState extends State<_AgendaAdminView> {
                                   'CPF protegido: ${value['patient_document']}'),
                               Text(
                                   'Data e horário: ${showDate(DateTime.parse(value['scheduled_at'].toString()))}'),
-                              Text('Especialidade: ${value['specialty']}'),
+                              Text(
+                                  'Especialidade: ${specialtyDisplayName(value['specialty'].toString())}'),
                               Text('Profissional: ${value['professional']}'),
                               Text('Prioridade: ${value['legal_priority']}'),
-                              Text(
-                                  'Risco: ${value['risk_classification'] ?? 'Não classificado'}'),
+                              Align(
+                                  alignment: Alignment.centerLeft,
+                                  child: AppRiskIndicator(
+                                      risk: value['risk_classification']
+                                          ?.toString())),
                               Text(
                                   'Status: ${statusLabel(value['status'].toString())}'),
                             ]))),
@@ -831,7 +1283,7 @@ class _AgendaAdminViewState extends State<_AgendaAdminView> {
         builder: (c) => AlertDialog(
                 title: const Text('Confirmar chegada?'),
                 content: Text(
-                    'Confirmar a chegada de ${item.patient} para ${item.specialty}?'),
+                    'Confirmar a chegada de ${item.patient} para ${specialtyDisplayName(item.specialty)}?'),
                 actions: [
                   TextButton(
                       onPressed: () => Navigator.pop(c, false),
@@ -853,109 +1305,190 @@ class _AgendaAdminViewState extends State<_AgendaAdminView> {
 
   @override
   Widget build(BuildContext context) => ListView(children: [
-        Text(widget.checkinOnly ? 'Confirmar chegada' : 'Agenda e agendamentos',
+        Text(widget.title,
             style: const TextStyle(fontSize: 25, fontWeight: FontWeight.w800)),
         const Text(
             'Filtre por data, especialidade, profissional, status, nome ou CPF. O CPF nunca é exibido por completo.'),
         const SizedBox(height: 16),
-        Wrap(
-            spacing: 12,
-            runSpacing: 12,
-            crossAxisAlignment: WrapCrossAlignment.center,
-            children: [
-              SizedBox(
-                  width: 260,
-                  child: TextField(
-                      controller: search,
-                      decoration: const InputDecoration(
-                          labelText: 'Nome ou CPF do paciente',
-                          prefixIcon: Icon(Icons.search)),
-                      onSubmitted: (_) => filter())),
-              if (!widget.checkinOnly)
-                SizedBox(
-                    width: 220,
-                    child: DropdownButtonFormField<String>(
-                        initialValue: status,
-                        isExpanded: true,
-                        decoration: const InputDecoration(labelText: 'Status'),
-                        items: const [
-                          DropdownMenuItem(value: null, child: Text('Todos')),
-                          DropdownMenuItem(
-                              value: 'agendado', child: Text('Agendada')),
-                          DropdownMenuItem(
-                              value: 'em_espera', child: Text('Check-in')),
-                          DropdownMenuItem(
-                              value: 'em_triagem', child: Text('Em triagem')),
-                          DropdownMenuItem(
-                              value: 'em_atendimento',
-                              child: Text('Em atendimento')),
-                          DropdownMenuItem(
-                              value: 'concluido', child: Text('Concluída')),
-                          DropdownMenuItem(
-                              value: 'cancelado', child: Text('Cancelada')),
-                          DropdownMenuItem(value: 'falta', child: Text('Falta'))
-                        ],
-                        onChanged: (v) {
-                          status = v;
-                          filter();
-                        })),
-              SizedBox(
-                  width: 220,
-                  child: DropdownButtonFormField<String>(
-                      initialValue: specialty,
-                      isExpanded: true,
-                      decoration:
-                          const InputDecoration(labelText: 'Especialidade'),
-                      items: [
-                        const DropdownMenuItem(
-                            value: null, child: Text('Todas')),
-                        for (final value in widget.specialties)
-                          DropdownMenuItem(
-                              value: value['name'].toString(),
-                              child: Text(value['name'].toString()))
-                      ],
-                      onChanged: (v) {
-                        specialty = v;
-                        filter();
-                      })),
-              SizedBox(
-                  width: 220,
-                  child: DropdownButtonFormField<int>(
-                      initialValue: professionalId,
-                      isExpanded: true,
-                      decoration:
-                          const InputDecoration(labelText: 'Profissional'),
-                      items: [
-                        const DropdownMenuItem(
-                            value: null, child: Text('Todos')),
-                        for (final value in widget.professionals)
-                          DropdownMenuItem(
-                              value: value['id'] as int,
-                              child: Text(value['name'].toString()))
-                      ],
-                      onChanged: (v) {
-                        professionalId = v;
-                        filter();
-                      })),
-              OutlinedButton.icon(
-                  onPressed: () async {
-                    final picked = await showDatePicker(
-                        context: context,
-                        firstDate: DateTime(2020),
-                        lastDate: DateTime.now().add(const Duration(days: 730)),
-                        initialDate: day);
-                    if (picked != null) {
-                      day = picked;
-                      filter();
-                    }
-                  },
-                  icon: const Icon(Icons.calendar_today),
-                  label: Text(showOnlyDate(day))),
-              FilledButton.icon(
-                  onPressed: busy ? null : filter,
-                  icon: const Icon(Icons.filter_alt),
-                  label: const Text('Aplicar filtros'))
-            ]),
+        Semantics(
+          key: const Key('admin-agenda-filter-region'),
+          container: true,
+          label: 'Filtros de agendamentos administrativos',
+          child: AppSurfaceCard(
+            child: LayoutBuilder(builder: (context, constraints) {
+              final fieldWidth = responsiveFilterWidth(constraints.maxWidth);
+              return Wrap(
+                  spacing: 12,
+                  runSpacing: 12,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  children: [
+                    SizedBox(
+                        width: fieldWidth,
+                        child: Semantics(
+                            textField: true,
+                            label: 'Buscar paciente por nome ou CPF',
+                            child: TextField(
+                                key: const Key('admin-agenda-search'),
+                                controller: search,
+                                textInputAction: TextInputAction.search,
+                                decoration: const InputDecoration(
+                                    labelText: 'Paciente',
+                                    hintText: 'Nome ou CPF',
+                                    prefixIcon: ExcludeSemantics(
+                                        child: Icon(Icons.search))),
+                                onSubmitted: (_) => filter()))),
+                    if (!widget.checkinOnly)
+                      SizedBox(
+                          width: fieldWidth,
+                          child: DropdownButtonFormField<String>(
+                              key: ValueKey('admin-agenda-status-$status'),
+                              initialValue: status,
+                              isExpanded: true,
+                              itemHeight: null,
+                              decoration:
+                                  const InputDecoration(labelText: 'Status'),
+                              items: const [
+                                DropdownMenuItem(
+                                    value: null, child: Text('Todos')),
+                                DropdownMenuItem(
+                                    value: 'agendado', child: Text('Agendada')),
+                                DropdownMenuItem(
+                                    value: 'em_espera',
+                                    child: Text('Check-in')),
+                                DropdownMenuItem(
+                                    value: 'em_triagem',
+                                    child: Text('Em triagem')),
+                                DropdownMenuItem(
+                                    value: 'em_atendimento',
+                                    child: Text('Em atendimento')),
+                                DropdownMenuItem(
+                                    value: 'concluido',
+                                    child: Text('Concluída')),
+                                DropdownMenuItem(
+                                    value: 'cancelado',
+                                    child: Text('Cancelada')),
+                                DropdownMenuItem(
+                                    value: 'falta', child: Text('Falta'))
+                              ],
+                              onChanged: busy
+                                  ? null
+                                  : (value) {
+                                      setState(() => status = value);
+                                      filter();
+                                    })),
+                    SizedBox(
+                        width: fieldWidth,
+                        child: DropdownButtonFormField<String>(
+                            key: ValueKey('admin-agenda-specialty-$specialty'),
+                            initialValue: specialty,
+                            isExpanded: true,
+                            itemHeight: null,
+                            decoration: const InputDecoration(
+                                labelText: 'Especialidade'),
+                            items: [
+                              const DropdownMenuItem(
+                                  value: null, child: Text('Todas')),
+                              for (final value in widget.specialties)
+                                DropdownMenuItem(
+                                    value: value['name'].toString(),
+                                    child: Text(
+                                        specialtyDisplayName(
+                                            value['name'].toString()),
+                                        maxLines: 2,
+                                        softWrap: true))
+                            ],
+                            onChanged: busy
+                                ? null
+                                : (value) {
+                                    setState(() => specialty = value);
+                                    filter();
+                                  })),
+                    SizedBox(
+                        width: fieldWidth,
+                        child: DropdownButtonFormField<int>(
+                            key: ValueKey(
+                                'admin-agenda-professional-$professionalId'),
+                            initialValue: professionalId,
+                            isExpanded: true,
+                            itemHeight: null,
+                            decoration: const InputDecoration(
+                                labelText: 'Profissional'),
+                            items: [
+                              const DropdownMenuItem(
+                                  value: null, child: Text('Todos')),
+                              for (final value in widget.professionals)
+                                DropdownMenuItem(
+                                    value: value['id'] as int,
+                                    child: Text(value['name'].toString(),
+                                        maxLines: 2, softWrap: true))
+                            ],
+                            onChanged: busy
+                                ? null
+                                : (value) {
+                                    setState(() => professionalId = value);
+                                    filter();
+                                  })),
+                    if (!widget.checkinOnly)
+                      SizedBox(
+                          width: fieldWidth,
+                          child: DropdownButtonFormField<String>(
+                              key: ValueKey('admin-agenda-risk-$risk'),
+                              initialValue: risk,
+                              isExpanded: true,
+                              itemHeight: null,
+                              decoration: const InputDecoration(
+                                  labelText: 'Classificação de risco'),
+                              items: [
+                                const DropdownMenuItem(
+                                    value: null, child: Text('Todas')),
+                                for (final item in RiskClassification.options)
+                                  DropdownMenuItem(
+                                      value: item.$1,
+                                      child: AppRiskFilterItem(risk: item.$1)),
+                              ],
+                              onChanged: busy
+                                  ? null
+                                  : (value) {
+                                      setState(() => risk = value);
+                                      filter();
+                                    })),
+                    SizedBox(
+                        width: fieldWidth,
+                        child: OutlinedButton.icon(
+                            key: const Key('admin-agenda-date'),
+                            onPressed: busy
+                                ? null
+                                : () async {
+                                    final picked = await showDatePicker(
+                                        context: context,
+                                        firstDate: DateTime(2020),
+                                        lastDate: DateTime.now()
+                                            .add(const Duration(days: 730)),
+                                        initialDate: day);
+                                    if (picked != null) {
+                                      setState(() => day = picked);
+                                      await filter();
+                                    }
+                                  },
+                            icon: const Icon(Icons.calendar_today_outlined),
+                            label: Text('Data: ${showOnlyDate(day)}'))),
+                    SizedBox(
+                        width: fieldWidth,
+                        child: FilledButton.icon(
+                            onPressed: busy ? null : filter,
+                            icon: const Icon(Icons.filter_alt),
+                            label: const Text('Aplicar filtros'))),
+                    SizedBox(
+                        width: fieldWidth,
+                        child: OutlinedButton.icon(
+                            key: const Key('admin-agenda-clear-filters'),
+                            onPressed: busy ? null : clearFilters,
+                            icon: const Icon(Icons.filter_alt_off_outlined),
+                            label: const Text('Limpar filtros')))
+                  ]);
+            }),
+          ),
+        ),
         const SizedBox(height: 16),
         if (busy) const LinearProgressIndicator(),
         if (!busy && items.isEmpty)
@@ -974,7 +1507,7 @@ class _AgendaAdminViewState extends State<_AgendaAdminView> {
                               style:
                                   const TextStyle(fontWeight: FontWeight.w800)),
                           Text(
-                              '${item.patientDocument} • ${item.specialty} • ${item.professional}'),
+                              '${item.patientDocument} • ${specialtyDisplayName(item.specialty)} • ${item.professional}'),
                           Text('Prioridade: ${item.legalPriority}'),
                           const SizedBox(height: 6),
                           AppStatusBadge(
@@ -1153,7 +1686,8 @@ class _DoctorsViewState extends State<_DoctorsView> {
                     .textTheme
                     .titleMedium
                     ?.copyWith(fontWeight: FontWeight.w800)),
-            Text('${doctor.maskedCpf} • ${doctor.specialty}'),
+            Text(
+                '${doctor.maskedCpf} • ${specialtyDisplayName(doctor.specialty)}'),
             Text(doctor.active ? 'Ativo' : 'Inativo'),
           ]);
           final actions = Wrap(spacing: 8, runSpacing: 8, children: [
@@ -1399,50 +1933,54 @@ class _InternalUsersViewState extends State<_InternalUsersView> {
                 icon: Icons.person_add,
                 onPressed: () => _openForm())),
         const SizedBox(height: 16),
-        Wrap(spacing: 12, runSpacing: 12, children: [
-          SizedBox(
-              width: 260,
-              child: TextField(
-                  controller: search,
-                  decoration: const InputDecoration(
-                      labelText: 'Pesquisar por nome',
-                      prefixIcon: Icon(Icons.search)),
-                  onSubmitted: (_) => filter())),
-          if (!widget.professionalOnly)
+        LayoutBuilder(builder: (context, constraints) {
+          final fieldWidth =
+              responsiveFilterWidth(constraints.maxWidth, maxColumns: 3);
+          return Wrap(spacing: 12, runSpacing: 12, children: [
             SizedBox(
-                width: 190,
-                child: DropdownButtonFormField<String>(
-                    initialValue: role,
+                width: fieldWidth,
+                child: TextField(
+                    controller: search,
+                    decoration: const InputDecoration(
+                        labelText: 'Pesquisar por nome',
+                        prefixIcon: Icon(Icons.search)),
+                    onSubmitted: (_) => filter())),
+            if (!widget.professionalOnly)
+              SizedBox(
+                  width: fieldWidth,
+                  child: DropdownButtonFormField<String>(
+                      initialValue: role,
+                      isExpanded: true,
+                      decoration: const InputDecoration(labelText: 'Perfil'),
+                      items: const [
+                        DropdownMenuItem(value: null, child: Text('Todos')),
+                        DropdownMenuItem(
+                            value: 'recepcao', child: Text('Recepção')),
+                        DropdownMenuItem(
+                            value: 'enfermagem', child: Text('Enfermagem')),
+                        DropdownMenuItem(value: 'medico', child: Text('Médico'))
+                      ],
+                      onChanged: (v) {
+                        role = v;
+                        filter();
+                      })),
+            SizedBox(
+                width: fieldWidth,
+                child: DropdownButtonFormField<bool>(
+                    initialValue: active,
                     isExpanded: true,
-                    decoration: const InputDecoration(labelText: 'Perfil'),
+                    decoration: const InputDecoration(labelText: 'Situação'),
                     items: const [
-                      DropdownMenuItem(value: null, child: Text('Todos')),
-                      DropdownMenuItem(
-                          value: 'recepcao', child: Text('Recepção')),
-                      DropdownMenuItem(
-                          value: 'enfermagem', child: Text('Enfermagem')),
-                      DropdownMenuItem(value: 'medico', child: Text('Médico'))
+                      DropdownMenuItem(value: null, child: Text('Todas')),
+                      DropdownMenuItem(value: true, child: Text('Ativa')),
+                      DropdownMenuItem(value: false, child: Text('Inativa'))
                     ],
                     onChanged: (v) {
-                      role = v;
+                      active = v;
                       filter();
-                    })),
-          SizedBox(
-              width: 180,
-              child: DropdownButtonFormField<bool>(
-                  initialValue: active,
-                  isExpanded: true,
-                  decoration: const InputDecoration(labelText: 'Situação'),
-                  items: const [
-                    DropdownMenuItem(value: null, child: Text('Todas')),
-                    DropdownMenuItem(value: true, child: Text('Ativa')),
-                    DropdownMenuItem(value: false, child: Text('Inativa'))
-                  ],
-                  onChanged: (v) {
-                    active = v;
-                    filter();
-                  }))
-        ]),
+                    }))
+          ]);
+        }),
         const SizedBox(height: 16),
         if (busy) const LinearProgressIndicator(),
         if (!busy && users.isEmpty)
@@ -1458,7 +1996,7 @@ class _InternalUsersViewState extends State<_InternalUsersView> {
                             : Icons.support_agent)),
                 title: Text(user.name),
                 subtitle: Text(
-                    '${user.role == 'medico' ? 'Médico' : user.role == 'enfermagem' ? 'Enfermagem' : user.role == 'admin' ? 'Administrador' : 'Recepção'} • ${user.maskedCpf}\n${user.email}${user.specialty == null ? '' : ' • ${user.specialty}'}'),
+                    '${user.role == 'medico' ? 'Médico' : user.role == 'enfermagem' ? 'Enfermagem' : user.role == 'admin' ? 'Administrador' : 'Recepção'} • ${user.maskedCpf}\n${user.email}${user.specialty == null ? '' : ' • ${specialtyDisplayName(user.specialty!)}'}'),
                 isThreeLine: true);
             final actions = Row(mainAxisSize: MainAxisSize.min, children: [
               Icon(user.active ? Icons.check_circle : Icons.block,
@@ -1681,6 +2219,7 @@ class _InternalUserDialogState extends State<_InternalUserDialog> {
                     DropdownButtonFormField<String>(
                         initialValue: role,
                         isExpanded: true,
+                        itemHeight: null,
                         decoration: const InputDecoration(labelText: 'Perfil'),
                         items: const [
                           DropdownMenuItem(
@@ -1688,9 +2227,7 @@ class _InternalUserDialogState extends State<_InternalUserDialog> {
                           DropdownMenuItem(
                               value: 'enfermagem', child: Text('Enfermagem')),
                           DropdownMenuItem(
-                              value: 'medico',
-                              child: Text('Médico',
-                                  overflow: TextOverflow.ellipsis))
+                              value: 'medico', child: Text('Médico'))
                         ],
                         onChanged: (v) => setState(() {
                               role = v!;
@@ -1707,6 +2244,7 @@ class _InternalUserDialogState extends State<_InternalUserDialog> {
                       DropdownButtonFormField<int>(
                           initialValue: specialtyId,
                           isExpanded: true,
+                          itemHeight: null,
                           decoration: InputDecoration(
                               labelText: 'Especialidade',
                               errorText: errors['specialty_id']),
@@ -1716,8 +2254,11 @@ class _InternalUserDialogState extends State<_InternalUserDialog> {
                             for (final item in widget.specialties)
                               DropdownMenuItem(
                                   value: item['id'] as int,
-                                  child: Text(item['name'].toString(),
-                                      overflow: TextOverflow.ellipsis))
+                                  child: Text(
+                                      specialtyDisplayName(
+                                          item['name'].toString()),
+                                      softWrap: true,
+                                      maxLines: 2))
                           ],
                           onChanged: (v) => setState(() => specialtyId = v)),
                       if (role == 'enfermagem')
@@ -1766,7 +2307,7 @@ class _GridAdminView extends StatelessWidget {
               child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                Text('Grades e horários',
+                Text('Horários disponíveis',
                     style:
                         TextStyle(fontSize: 25, fontWeight: FontWeight.w800)),
                 Text(
@@ -1783,7 +2324,8 @@ class _GridAdminView extends StatelessWidget {
           Card(
               child: ListTile(
                   leading: const Icon(Icons.calendar_month),
-                  title: Text('${item['professional']} • ${item['specialty']}'),
+                  title: Text(
+                      '${item['professional']} • ${specialtyDisplayName(item['specialty'].toString())}'),
                   subtitle: Text(
                       '${item['day']} • ${item['start_time']} às ${item['end_time']} • ${item['duration_minutes']} min • ${item['capacity']} vaga(s)\nIntervalo: ${item['break_start'] ?? 'sem'}${item['break_end'] == null ? '' : ' às ${item['break_end']}'}'),
                   isThreeLine: true,
@@ -1844,12 +2386,12 @@ class _GridDialog extends StatefulWidget {
 class _GridDialogState extends State<_GridDialog> {
   final key = GlobalKey<FormState>();
   final day = TextEditingController(),
-      start = TextEditingController(text: '07:00'),
-      end = TextEditingController(text: '18:00'),
+      start = TextEditingController(text: '09:00'),
+      end = TextEditingController(text: '11:00'),
       duration = TextEditingController(text: '60'),
       capacity = TextEditingController(text: '1'),
-      breakStart = TextEditingController(text: '12:00'),
-      breakEnd = TextEditingController(text: '13:00');
+      breakStart = TextEditingController(),
+      breakEnd = TextEditingController();
   int? professionalId, specialtyId;
   bool saving = false;
   @override
@@ -1902,6 +2444,8 @@ class _GridDialogState extends State<_GridDialog> {
                       child: Column(children: [
                     DropdownButtonFormField<int>(
                         initialValue: professionalId,
+                        isExpanded: true,
+                        itemHeight: null,
                         decoration:
                             const InputDecoration(labelText: 'Profissional'),
                         validator: (v) =>
@@ -1910,12 +2454,15 @@ class _GridDialogState extends State<_GridDialog> {
                           for (final x in widget.professionals)
                             DropdownMenuItem(
                                 value: x['id'] as int,
-                                child: Text(x['name'].toString()))
+                                child: Text(x['name'].toString(),
+                                    maxLines: 2, softWrap: true))
                         ],
                         onChanged: (v) => professionalId = v),
                     const SizedBox(height: 12),
                     DropdownButtonFormField<int>(
                         initialValue: specialtyId,
+                        isExpanded: true,
+                        itemHeight: null,
                         decoration:
                             const InputDecoration(labelText: 'Especialidade'),
                         validator: (v) =>
@@ -1924,7 +2471,10 @@ class _GridDialogState extends State<_GridDialog> {
                           for (final x in widget.specialties)
                             DropdownMenuItem(
                                 value: x['id'] as int,
-                                child: Text(x['name'].toString()))
+                                child: Text(
+                                    specialtyDisplayName(x['name'].toString()),
+                                    maxLines: 2,
+                                    softWrap: true))
                         ],
                         onChanged: (v) => specialtyId = v),
                     const SizedBox(height: 12),
@@ -1950,48 +2500,54 @@ class _GridDialogState extends State<_GridDialog> {
                             ? 'Informe uma data válida.'
                             : null),
                     const SizedBox(height: 12),
-                    Wrap(spacing: 12, runSpacing: 12, children: [
-                      SizedBox(
-                          width: 150,
-                          child: TextFormField(
-                              controller: start,
-                              decoration:
-                                  const InputDecoration(labelText: 'Início'))),
-                      SizedBox(
-                          width: 150,
-                          child: TextFormField(
-                              controller: end,
-                              decoration:
-                                  const InputDecoration(labelText: 'Fim'))),
-                      SizedBox(
-                          width: 150,
-                          child: TextFormField(
-                              controller: duration,
-                              readOnly: true,
-                              keyboardType: TextInputType.number,
-                              decoration: const InputDecoration(
-                                  labelText: 'Duração (min)'))),
-                      SizedBox(
-                          width: 150,
-                          child: TextFormField(
-                              controller: capacity,
-                              readOnly: true,
-                              keyboardType: TextInputType.number,
-                              decoration:
-                                  const InputDecoration(labelText: 'Vagas'))),
-                      SizedBox(
-                          width: 150,
-                          child: TextFormField(
-                              controller: breakStart,
-                              decoration: const InputDecoration(
-                                  labelText: 'Início intervalo'))),
-                      SizedBox(
-                          width: 150,
-                          child: TextFormField(
-                              controller: breakEnd,
-                              decoration: const InputDecoration(
-                                  labelText: 'Fim intervalo'))),
-                    ]),
+                    LayoutBuilder(builder: (context, constraints) {
+                      final fieldWidth = responsiveFilterWidth(
+                          constraints.maxWidth,
+                          minWidth: 150,
+                          maxColumns: 3);
+                      return Wrap(spacing: 12, runSpacing: 12, children: [
+                        SizedBox(
+                            width: fieldWidth,
+                            child: TextFormField(
+                                controller: start,
+                                decoration: const InputDecoration(
+                                    labelText: 'Início'))),
+                        SizedBox(
+                            width: fieldWidth,
+                            child: TextFormField(
+                                controller: end,
+                                decoration:
+                                    const InputDecoration(labelText: 'Fim'))),
+                        SizedBox(
+                            width: fieldWidth,
+                            child: TextFormField(
+                                controller: duration,
+                                readOnly: true,
+                                keyboardType: TextInputType.number,
+                                decoration: const InputDecoration(
+                                    labelText: 'Duração (min)'))),
+                        SizedBox(
+                            width: fieldWidth,
+                            child: TextFormField(
+                                controller: capacity,
+                                readOnly: true,
+                                keyboardType: TextInputType.number,
+                                decoration:
+                                    const InputDecoration(labelText: 'Vagas'))),
+                        SizedBox(
+                            width: fieldWidth,
+                            child: TextFormField(
+                                controller: breakStart,
+                                decoration: const InputDecoration(
+                                    labelText: 'Início intervalo'))),
+                        SizedBox(
+                            width: fieldWidth,
+                            child: TextFormField(
+                                controller: breakEnd,
+                                decoration: const InputDecoration(
+                                    labelText: 'Fim intervalo'))),
+                      ]);
+                    }),
                     const SizedBox(height: 12),
                     const InfoPanel(
                         icon: Icons.schedule,

@@ -3,22 +3,28 @@
 from datetime import date, datetime, timedelta
 import logging
 import os
-from fastapi import Depends, FastAPI, HTTPException, Request
+from pathlib import Path
+import sqlite3
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import func, inspect, select, text, update
+from sqlalchemy import func, inspect, or_, select, text, update
 from sqlalchemy.orm import Session
 from app.core.database import Base, SessionLocal, engine, get_db
+from app.core import clock
+from app.core.risk import LEGACY_RISK_MAPPING, RISK_LEVELS
+from app.core.specialty import GENERAL_SPECIALTY, canonical_specialty_name
 from app.models import Appointment, ProfessionalSchedule, User
 from app.schemas import (
     AppointmentCreate,
     AppointmentResponse,
-    AvailableSlot,
     CalendarSlot,
     LoginRequest,
     PatientRegistration,
+    PatientPriorityUpdate,
     RescheduleRequest,
     TokenResponse,
     UserResponse,
+    RegistrationResponse,
     PatientProfile,
     PatientSummary,
 )
@@ -44,7 +50,9 @@ from app.core.security import (
     canonical_role,
     permissions_for,
 )
-from app.models import Guardian, PatientGuardian, Specialty
+from app.models import (
+    Guardian, PatientGuardian, PriorityCondition, PriorityConditionHistory, Specialty,
+)
 from sqlalchemy.exc import IntegrityError
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -105,13 +113,8 @@ def valid_cpf(value: str) -> bool:
 
 
 def is_minor(birth_date: date) -> bool:
-    today = date.today()
-    return (
-        today.year
-        - birth_date.year
-        - ((today.month, today.day) < (birth_date.month, birth_date.day))
-        < 18
-    )
+    from app.services.appointments import full_age
+    return full_age(birth_date) < 18
 
 
 def valid_password(value: str) -> bool:
@@ -141,7 +144,7 @@ def as_user(user: User) -> UserResponse:
 def as_appointment(item: Appointment, include_risk: bool = False) -> AppointmentResponse:
     return AppointmentResponse(
         id=item.id,
-        specialty=item.especialidade,
+        specialty=canonical_specialty_name(item.especialidade),
         professional=item.medico.nome,
         doctor_id=item.medico_id,
         scheduled_at=item.data_horario,
@@ -151,6 +154,8 @@ def as_appointment(item: Appointment, include_risk: bool = False) -> Appointment
 
 
 def as_patient(user: User) -> PatientProfile:
+    from app.services.appointments import full_age, legal_priority_code, legal_priority_label
+
     cpf = user.cpf or ""
     return PatientProfile(
         name=user.nome,
@@ -159,6 +164,22 @@ def as_patient(user: User) -> PatientProfile:
         birth_date=user.data_nascimento.date() if user.data_nascimento else None,
         email=user.email,
         phone=user.telefone,
+        age=full_age(user.data_nascimento) if user.data_nascimento else None,
+        legal_priority=legal_priority_code(user),
+        priority_reason=legal_priority_label(user),
+        priority_conditions=[
+            {
+                "condition": item.condicao,
+                "status": item.status,
+                "reported_at": item.informada_em,
+                "validated_at": item.validada_em,
+                "validated_by": (
+                    item.responsavel_validacao.nome if item.responsavel_validacao else None
+                ),
+            }
+            for item in sorted(user.condicoes_prioritarias, key=lambda value: value.condicao)
+            if item.status != "retirada"
+        ],
     )
 
 
@@ -167,7 +188,94 @@ def protected_name(value: str) -> str:
     return parts[0] + (f" {parts[-1][0]}." if len(parts) > 1 else "")
 
 
+def _backup_before_priority_migration() -> Path | None:
+    """Cria uma única cópia consistente antes da migração aditiva de prioridade."""
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    if "usuarios" not in tables or "condicoes_prioritarias" in tables:
+        return None
+    database = engine.url.database
+    if engine.url.get_backend_name() != "sqlite" or not database or database == ":memory:":
+        return None
+    source = Path(database).resolve()
+    if not source.exists():
+        return None
+    backup_dir = source.parent / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    destination = backup_dir / f"{source.stem}.pre-priority-validation.bak"
+    if destination.exists():
+        return destination
+    with sqlite3.connect(source) as source_db, sqlite3.connect(destination) as backup_db:
+        source_db.backup(backup_db)
+    return destination
+
+
+def _backup_before_risk_migration() -> Path | None:
+    """Cria uma única cópia do SQLite antes de converter a escala de risco."""
+    if engine.url.get_backend_name() != "sqlite" or engine.url.database in {None, ":memory:"}:
+        return None
+    source = Path(engine.url.database).resolve()
+    if not source.exists():
+        return None
+    backup_dir = source.parent / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    destination = backup_dir / f"{source.stem}.pre-risk-scale.bak"
+    if not destination.exists():
+        with sqlite3.connect(source) as source_db, sqlite3.connect(destination) as backup_db:
+            source_db.backup(backup_db)
+    return destination
+
+
+def migrate_risk_scale() -> int:
+    """Converte códigos antigos de risco de forma idempotente e auditável."""
+    tables = set(inspect(engine).get_table_names())
+    targets = [
+        ("consultas", "classificacao_risco"),
+        ("classificacoes_risco", "nivel_risco"),
+    ]
+    present = [(table, column) for table, column in targets if table in tables]
+    if not present:
+        return 0
+    legacy_values = tuple(LEGACY_RISK_MAPPING)
+    placeholders = ", ".join(f":legacy_{index}" for index in range(len(legacy_values)))
+    parameters = {f"legacy_{index}": value for index, value in enumerate(legacy_values)}
+    with engine.connect() as connection:
+        has_legacy = any(
+            connection.execute(
+                text(
+                    f"SELECT 1 FROM {table} WHERE lower({column}) IN ({placeholders}) LIMIT 1"
+                ),
+                parameters,
+            ).first()
+            for table, column in present
+        )
+    if not has_legacy:
+        logger.info("risk_scale_migration updated_records=0")
+        return 0
+    backup = _backup_before_risk_migration()
+    updated = 0
+    with engine.begin() as connection:
+        for table, column in present:
+            for legacy, official in LEGACY_RISK_MAPPING.items():
+                result = connection.execute(
+                    text(
+                        f"UPDATE {table} SET {column} = :official "
+                        f"WHERE lower({column}) = :legacy"
+                    ),
+                    {"official": official, "legacy": legacy},
+                )
+                updated += result.rowcount
+    logger.info(
+        "risk_scale_migration updated_records=%s backup=%s", updated, backup
+    )
+    return updated
+
+
 def migrate_database() -> None:
+    from app.core.demo_accounts import DEMO_ACCOUNTS
+
+    canonical_demo_cpfs = tuple(account.cpf for account in DEMO_ACCOUNTS)
+    _backup_before_priority_migration()
     Base.metadata.create_all(engine)
     existing = {column["name"] for column in inspect(engine).get_columns("usuarios")}
     fields = {
@@ -219,7 +327,7 @@ def migrate_database() -> None:
                 "resumo_atendimento": "TEXT",
             },
             "agendas_profissionais": {
-                "especialidade": "VARCHAR(80) DEFAULT 'Clínica geral'"
+                "especialidade": "VARCHAR(80) DEFAULT 'Clínica Geral'"
             },
         }.items():
             known = {c["name"] for c in inspect(engine).get_columns(table)}
@@ -273,17 +381,35 @@ def migrate_database() -> None:
             "CREATE INDEX IF NOT EXISTS ix_agenda_especialidade_data "
             "ON agendas_profissionais(especialidade, data_horario)"
         ))
+    migrate_risk_scale()
     with SessionLocal() as db:
+        from app.services.appointments import full_age
+
         db.execute(
-            update(User).where(User.perfil == "profissional").values(perfil="medico")
+            update(User)
+            .where(
+                User.perfil == "profissional",
+                User.cpf.not_in(canonical_demo_cpfs),
+            )
+            .values(perfil="medico")
         )
         db.execute(
             update(User)
-            .where(User.criado_em.is_(None))
-            .values(criado_em=datetime.utcnow(), atualizado_em=datetime.utcnow())
+            .where(
+                User.criado_em.is_(None),
+                User.cpf.not_in(canonical_demo_cpfs),
+            )
+            .values(
+                criado_em=clock.now_utc_naive(),
+                atualizado_em=clock.now_utc_naive(),
+            )
         )
-        if not db.scalar(select(Specialty).where(Specialty.nome == "Clínica geral")):
-            db.add(Specialty(nome="Clínica geral"))
+        if not db.scalar(
+            select(Specialty).where(
+                func.lower(func.trim(Specialty.nome)) == GENERAL_SPECIALTY.lower()
+            )
+        ):
+            db.add(Specialty(nome=GENERAL_SPECIALTY))
         for user in db.scalars(select(User).where(User.cpf_responsavel.is_not(None))):
             if not user.nome_responsavel:
                 continue
@@ -309,112 +435,84 @@ def migrate_database() -> None:
                         parentesco=user.parentesco_responsavel or "Responsável legal",
                     )
                 )
+        # O campo legado permanece apenas para compatibilidade. Idoso deriva
+        # exclusivamente da data; condições antigas sem evidência viram pendentes.
+        for user in db.scalars(
+            select(User).where(
+                User.perfil == "paciente",
+                User.cpf.not_in(canonical_demo_cpfs),
+            )
+        ).unique():
+            legacy = user.e_prioridade
+            if legacy in {"pcd", "gestante", "lactante"}:
+                condition = db.scalar(select(PriorityCondition).where(
+                    PriorityCondition.paciente_id == user.id,
+                    PriorityCondition.condicao == legacy,
+                ))
+                if not condition:
+                    condition = PriorityCondition(
+                        paciente_id=user.id, condicao=legacy, status="pendente"
+                    )
+                    db.add(condition)
+                    db.flush()
+                    db.add(PriorityConditionHistory(
+                        condicao_prioritaria_id=condition.id,
+                        status_anterior=None,
+                        status_novo="pendente",
+                        alterado_por=user.id,
+                    ))
+            user.e_prioridade = (
+                "idoso_60+"
+                if user.data_nascimento and full_age(user.data_nascimento) >= 60
+                else "geral"
+            )
         db.commit()
 
 
 def seed(db: Session) -> None:
-    if db.scalar(select(func.count(User.id))):
-        return
-    admin = User(
-        nome="Administrador UBS",
-        cpf="11144477735",
-        email="admin@ubs.local",
-        senha_hash=pwd.hash("Admin@123"),
-        perfil="admin",
-        email_verificado=True,
+    from app.services.demo_seed import (
+        ensure_canonical_demo_accounts,
+        ensure_canonical_demo_schedules,
     )
-    patient = User(
-        nome="Paciente Demonstração",
-        cpf="52998224725",
-        data_nascimento=datetime(1955, 1, 1),
-        email="paciente@ubs.local",
-        senha_hash=pwd.hash("Paciente@123"),
-        perfil="paciente",
-        email_verificado=True,
-        e_prioridade="idoso_60+",
-    )
-    receptionist = User(
-        nome="Recepção UBS",
-        cpf="12345678909",
-        email="recepcao@ubs.local",
-        senha_hash=pwd.hash("Recepcao@123"),
-        perfil="recepcao",
-        email_verificado=True,
-    )
-    ana = User(
-        nome="Dra. Ana Paula",
-        cpf="16899535009",
-        email="ana@ubs.local",
-        senha_hash=pwd.hash("Medico@123"),
-        perfil="medico",
-        email_verificado=True,
-    )
-    bruno = User(
-        nome="Dr. Victor Almeida",
-        cpf="39053344705",
-        email="victor.medico@ubs-rapida.local",
-        senha_hash=pwd.hash("Medico@123"),
-        perfil="medico",
-        email_verificado=True,
-    )
-    db.add_all([admin, patient, receptionist, ana, bruno])
-    db.flush()
-    base = datetime.now().replace(minute=0, second=0, microsecond=0) + timedelta(days=3)
-    for day in range(7):
-        for doctor in (ana, bruno):
-            for hour in (8, 9, 10, 14, 15):
-                db.add(
-                    ProfessionalSchedule(
-                        medico_id=doctor.id,
-                        data_horario=base + timedelta(days=day, hours=hour),
-                    )
-                )
-    db.add(
-        Appointment(
-            paciente_id=patient.id,
-            medico_id=ana.id,
-            especialidade="Clínica geral",
-            data_horario=base + timedelta(hours=9),
-            status="agendado",
-        )
-    )
-    db.commit()
+
+    try:
+        ensure_canonical_demo_accounts(db)
+        ensure_canonical_demo_schedules(db)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
 
-GENERAL_SPECIALTY = "Clínica Geral"
 GENERAL_HOURS = (7, 8, 9, 10, 11, 13, 14, 15, 16, 17)
 
 
 def ensure_future_general_schedule(db: Session) -> int:
     """Completa, sem duplicar, os próximos 14 dias úteis da agenda do MVP."""
-    from app.models import Specialty
+    from app.models import ProfessionalProfile, Specialty
 
-    now = datetime.now()
-    scheduled_doctor_id = db.scalar(
-        select(ProfessionalSchedule.medico_id).where(
-            func.lower(ProfessionalSchedule.especialidade)
-            == GENERAL_SPECIALTY.lower(),
-            ProfessionalSchedule.data_horario > now,
-        ).order_by(ProfessionalSchedule.data_horario)
-    )
-    doctor = db.get(User, scheduled_doctor_id) if scheduled_doctor_id else None
-    if not doctor or not doctor.ativo:
-        doctor = db.scalar(
-            select(User)
-            .where(
-                User.perfil.in_(["profissional", "medico"]),
-                User.ativo.is_(True),
-            )
-            .order_by(User.id)
+    now = clock.now_sao_paulo_naive()
+    specialty = db.scalar(
+        select(Specialty).where(
+            Specialty.ativo.is_(True),
+            func.lower(func.trim(Specialty.nome)) == GENERAL_SPECIALTY.lower(),
         )
+    )
+    if not specialty:
+        return 0
+    doctor = db.scalar(
+        select(User)
+        .join(ProfessionalProfile, ProfessionalProfile.usuario_id == User.id)
+        .where(
+            User.perfil.in_(["profissional", "medico"]),
+            User.ativo.is_(True),
+            ProfessionalProfile.ativo.is_(True),
+            ProfessionalProfile.especialidade_id == specialty.id,
+        )
+        .order_by(User.id)
+    )
     if not doctor:
         return 0
-    if not db.scalar(
-        select(Specialty).where(
-            func.lower(Specialty.nome) == GENERAL_SPECIALTY.lower()
-        )
-    ):
-        db.add(Specialty(nome=GENERAL_SPECIALTY))
     created = 0
     day = now.date() + timedelta(days=1)
     weekdays = 0
@@ -453,10 +551,18 @@ def ensure_future_general_schedule(db: Session) -> int:
 @app.on_event("startup")
 def startup() -> None:
     check_config()
+    demo_enabled = os.getenv("SEED_DEMO_DATA", "false").lower() == "true"
+    if demo_enabled:
+        from app.services.demo_seed import validate_canonical_demo_accounts
+
+        tables = set(inspect(engine).get_table_names())
+        if {"usuarios", "especialidades", "perfis_profissionais"} <= tables:
+            with SessionLocal() as validation_db:
+                validate_canonical_demo_accounts(validation_db)
     migrate_database()
     db = SessionLocal()
     try:
-        if os.getenv("SEED_DEMO_DATA", "false").lower() == "true":
+        if demo_enabled:
             seed(db)
         if os.getenv("SEED_FUTURE_SCHEDULE", "true").lower() == "true":
             ensure_future_general_schedule(db)
@@ -484,8 +590,7 @@ def login(payload: LoginRequest, request: Request, db: Session = Depends(get_db)
     return TokenResponse(access_token=make_token(user), user=as_user(user), permissions=permissions)
 
 
-@app.post("/auth/register", response_model=UserResponse, status_code=201)
-@app.post("/patients/register", response_model=UserResponse, status_code=201)
+@app.post("/auth/register", response_model=RegistrationResponse, status_code=201)
 def register(
     payload: PatientRegistration, request: Request, db: Session = Depends(get_db)
 ):
@@ -502,7 +607,7 @@ def register(
             422,
             "Nome completo deve ter 3 a 80 caracteres e conter apenas letras e espaços",
         )
-    if payload.birth_date > date.today() or payload.birth_date < date(1900, 1, 1):
+    if payload.birth_date > clock.today_sao_paulo() or payload.birth_date < date(1900, 1, 1):
         raise HTTPException(422, "Data de nascimento inválida")
     if any(c not in "0123456789.- " for c in payload.cpf) or not valid_cpf(cpf):
         raise HTTPException(422, "CPF inválido")
@@ -511,6 +616,14 @@ def register(
             422,
             "Senha deve ter 8 a 32 caracteres, maiúscula, minúscula, número e caractere especial",
         )
+    if payload.password != payload.password_confirmation:
+        raise HTTPException(
+            422,
+            {
+                "field": "password_confirmation",
+                "message": "As senhas não coincidem.",
+            },
+        )
     if any(c not in "0123456789 ()-" for c in payload.phone) or len(phone) not in {
         10,
         11,
@@ -518,9 +631,14 @@ def register(
         raise HTTPException(422, "Telefone deve ter DDD e 10 ou 11 dígitos")
     if payload.priority and payload.priority not in PRIORITIES:
         raise HTTPException(422, "Perfil prioritário inválido")
+    if payload.priority == "idoso_60+":
+        raise HTTPException(
+            422,
+            "A prioridade para pessoa idosa é calculada automaticamente pela data de nascimento.",
+        )
     if (
         payload.guardian_birth_date
-        and not date(1900, 1, 1) <= payload.guardian_birth_date <= date.today()
+        and not date(1900, 1, 1) <= payload.guardian_birth_date <= clock.today_sao_paulo()
     ):
         raise HTTPException(422, "Data de nascimento do responsável inválida")
     if minor and any(c not in "0123456789 ()-" for c in (payload.guardian_phone or "")):
@@ -536,17 +654,12 @@ def register(
         raise HTTPException(
             409, "CPF ou e-mail já cadastrado. Entre com sua conta ou use outros dados."
         )
-    priority = (
-        "idoso_60+"
-        if date.today().year
-        - payload.birth_date.year
-        - (
-            (date.today().month, date.today().day)
-            < (payload.birth_date.month, payload.birth_date.day)
-        )
-        >= 60
-        else (payload.priority or "geral")
-    )
+    from app.services.appointments import full_age
+
+    priority = "idoso_60+" if full_age(payload.birth_date) >= 60 else "geral"
+    declared_conditions = set(payload.priority_conditions)
+    if payload.priority in {"pcd", "gestante", "lactante"}:
+        declared_conditions.add(payload.priority)
     user = User(
         nome=payload.name.strip(),
         cpf=cpf,
@@ -555,8 +668,9 @@ def register(
         telefone=phone,
         senha_hash=pwd.hash(payload.password),
         perfil="paciente",
-        # O cadastro não depende de confirmação por e-mail. O e-mail continua
-        # obrigatório para identificação e para o fluxo "Esqueci minha senha".
+        # A confirmação de e-mail não faz parte do cadastro deste MVP.
+        # Manter o estado verdadeiro evita bloquear o primeiro login sem
+        # alterar contas já existentes no banco.
         email_verificado=True,
         e_prioridade=priority,
         e_menor_idade=minor,
@@ -575,6 +689,18 @@ def register(
     db.add(user)
     try:
         db.flush()
+        for name in sorted(declared_conditions):
+            condition = PriorityCondition(
+                paciente_id=user.id, condicao=name, status="pendente"
+            )
+            db.add(condition)
+            db.flush()
+            db.add(PriorityConditionHistory(
+                condicao_prioritaria_id=condition.id,
+                status_anterior=None,
+                status_novo="pendente",
+                alterado_por=user.id,
+            ))
         if minor:
             guardian = db.scalar(select(Guardian).where(Guardian.cpf == guardian_cpf))
             if not guardian:
@@ -613,17 +739,103 @@ def register(
             409, "CPF ou e-mail já cadastrado. Entre com sua conta ou use outros dados."
         )
     db.refresh(user)
-    return as_user(user)
+    return RegistrationResponse(**as_user(user).model_dump())
 
 
 @app.get("/auth/me", response_model=UserResponse)
-@app.get("/me", response_model=UserResponse)
 def me(user: User = Depends(current_user)):
     return as_user(user)
 
 
 @app.get("/patients/me", response_model=PatientProfile, response_model_exclude_none=True)
 def patient_me(user: User = Depends(require_roles("paciente"))):
+    return as_patient(user)
+
+
+@app.patch(
+    "/patients/me/priority-conditions",
+    response_model=PatientProfile,
+    response_model_exclude_none=True,
+)
+def update_patient_priority_conditions(
+    payload: PatientPriorityUpdate,
+    user: User = Depends(require_roles("paciente")),
+    db: Session = Depends(get_db),
+):
+    if payload.priority == "idoso_60+":
+        raise HTTPException(
+            422,
+            "A prioridade para pessoa idosa é calculada automaticamente pela data de nascimento.",
+        )
+    if payload.priority and payload.priority not in PRIORITIES:
+        raise HTTPException(422, "Condição prioritária inválida")
+    requested = set(payload.priority_conditions)
+    if payload.priority in {"pcd", "gestante", "lactante"}:
+        requested.add(payload.priority)
+    from app.services.appointments import record_audit_event
+
+    existing = {
+        condition.condicao: condition
+        for condition in db.scalars(select(PriorityCondition).where(
+            PriorityCondition.paciente_id == user.id,
+        ))
+    }
+    for name, condition in existing.items():
+        if name not in requested and condition.status == "pendente":
+            condition.status = "retirada"
+            db.add(PriorityConditionHistory(
+                condicao_prioritaria_id=condition.id,
+                status_anterior="pendente",
+                status_novo="retirada",
+                alterado_por=user.id,
+            ))
+            record_audit_event(
+                db,
+                user,
+                "condicao_prioritaria_retirada",
+                "condicao_prioritaria",
+                condition.id,
+                {
+                    "condicao": name,
+                    "status_anterior": "pendente",
+                    "status_novo": "retirada",
+                },
+            )
+    for name in sorted(requested):
+        condition = existing.get(name)
+        previous = condition.status if condition else None
+        if not condition:
+            condition = PriorityCondition(
+                paciente_id=user.id, condicao=name, status="pendente"
+            )
+            db.add(condition)
+            db.flush()
+        elif condition.status != "confirmada":
+            condition.status = "pendente"
+            condition.informada_em = clock.now_utc_naive()
+            condition.validada_por = None
+            condition.validada_em = None
+        if previous != condition.status:
+            db.add(PriorityConditionHistory(
+                condicao_prioritaria_id=condition.id,
+                status_anterior=previous,
+                status_novo=condition.status,
+                alterado_por=user.id,
+            ))
+            record_audit_event(
+                db,
+                user,
+                "condicao_prioritaria_informada",
+                "condicao_prioritaria",
+                condition.id,
+                {
+                    "condicao": name,
+                    "status_anterior": previous,
+                    "status_novo": condition.status,
+                },
+            )
+    db.commit()
+    db.refresh(user)
     return as_patient(user)
 
 
@@ -635,7 +847,7 @@ def patient_summary(
         select(Appointment)
         .where(
             Appointment.paciente_id == user.id,
-            Appointment.data_horario > datetime.now(),
+            Appointment.data_horario > clock.now_sao_paulo_naive(),
             Appointment.status.not_in(["cancelado", "concluido", "falta"]),
         )
         .order_by(Appointment.data_horario)
@@ -645,25 +857,6 @@ def patient_summary(
         patient=as_patient(user),
         next_appointment=as_appointment(next_item) if next_item else None,
     )
-
-
-@app.get("/appointments", response_model=list[AppointmentResponse])
-def appointments(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    query = (
-        select(Appointment).join(Appointment.medico).order_by(Appointment.data_horario)
-    )
-    if user.perfil == "paciente":
-        query = query.where(Appointment.paciente_id == user.id)
-    elif canonical_role(user.perfil) == "medico":
-        query = query.where(
-            Appointment.medico_id == user.id,
-            Appointment.chegada_em.is_not(None),
-            Appointment.triagem_em.is_not(None),
-            Appointment.status.in_(["em_triagem", "em_atendimento"]),
-        )
-    elif user.perfil == "enfermagem":
-        query = query.where(Appointment.chegada_em.is_not(None))
-    return [as_appointment(item, user.perfil != "paciente") for item in db.scalars(query).unique()]
 
 
 @app.get("/appointments/me", response_model=list[AppointmentResponse], response_model_exclude_none=True)
@@ -681,13 +874,40 @@ def patient_appointments(
 
 
 @app.get("/queue")
-def queue(user: User = Depends(require_roles(*STAFF)), db: Session = Depends(get_db)):
-    from app.services.appointments import mark_overdue_absences, queue_sort_key
+def queue(
+    day: date = Query(default_factory=clock.today_sao_paulo),
+    specialty: str | None = None,
+    professional_id: int | None = None,
+    status: str | None = None,
+    risk: str | None = None,
+    patient: str | None = None,
+    user: User = Depends(require_roles(*STAFF)),
+    db: Session = Depends(get_db),
+):
+    from app.services.appointments import legal_priority_code, mark_overdue_absences, queue_sort_key
+    valid_statuses = {
+        "agendado", "em_espera", "em_triagem", "em_atendimento",
+        "concluido", "cancelado", "falta",
+    }
+    specialty = specialty.strip() if specialty else None
+    status = status.strip() if status else None
+    risk = risk.strip() if risk else None
+    patient = patient.strip() if patient else None
+    if status and status not in valid_statuses:
+        raise HTTPException(422, "Status de consulta inválido")
+    if risk and risk not in RISK_LEVELS:
+        raise HTTPException(422, "Classificação de risco inválida")
     if canonical_role(user.perfil) != "medico":
         mark_overdue_absences(db, user)
+    start = datetime.combine(day, datetime.min.time())
+    end = start + timedelta(days=1)
     query = (
         select(Appointment)
-        .where(Appointment.status.in_(["em_espera", "em_triagem", "em_atendimento"]))
+        .where(
+            Appointment.data_horario >= start,
+            Appointment.data_horario < end,
+            Appointment.status.in_(["em_espera", "em_triagem", "em_atendimento"]),
+        )
         .order_by(Appointment.data_horario)
     )
     if canonical_role(user.perfil) == "medico":
@@ -696,6 +916,25 @@ def queue(user: User = Depends(require_roles(*STAFF)), db: Session = Depends(get
             Appointment.triagem_em.is_not(None),
             Appointment.status.in_(["em_triagem", "em_atendimento"]),
         )
+    if specialty:
+        query = query.where(
+            func.lower(func.trim(Appointment.especialidade))
+            == canonical_specialty_name(specialty).lower()
+        )
+    if professional_id:
+        query = query.where(Appointment.medico_id == professional_id)
+    if status:
+        query = query.where(Appointment.status == status)
+    if risk:
+        query = query.where(Appointment.classificacao_risco == risk)
+    if patient:
+        term = patient.lower()
+        cpf = "".join(char for char in term if char.isdigit())
+        can_search_cpf = user.perfil in {"admin", "recepcao"}
+        query = query.join(Appointment.paciente).where(or_(
+            func.lower(User.nome).contains(term),
+            User.cpf.contains(cpf) if cpf and can_search_cpf else False,
+        ))
     ordered = sorted(db.scalars(query).unique(), key=queue_sort_key)
     return [
         {
@@ -703,77 +942,15 @@ def queue(user: User = Depends(require_roles(*STAFF)), db: Session = Depends(get
             "id": item.id,
             "patient": protected_name(item.paciente.nome),
             "professional": item.medico.nome,
-            "specialty": item.especialidade,
+            "professional_id": item.medico_id,
+            "specialty": canonical_specialty_name(item.especialidade),
             "status": item.status,
             "risk_classification": item.classificacao_risco,
-            "legal_priority": item.paciente.e_prioridade or "geral",
+            "legal_priority": legal_priority_code(item.paciente),
             "scheduled_at": item.data_horario,
             "arrived_at": item.chegada_em,
         }
         for position, item in enumerate(ordered, start=1)
-    ]
-
-
-@app.get("/available-slots", response_model=list[AvailableSlot])
-@app.get("/appointments/available", response_model=list[AvailableSlot])
-def available(
-    specialty: str,
-    doctor_id: int | None = None,
-    user: User = Depends(current_user),
-    db: Session = Depends(get_db),
-):
-    query = (
-        select(ProfessionalSchedule)
-        .join(ProfessionalSchedule.medico)
-        .where(
-            ProfessionalSchedule.especialidade == specialty,
-            ProfessionalSchedule.bloqueado.is_(False),
-            ProfessionalSchedule.data_horario > datetime.now(),
-        )
-    )
-    if doctor_id:
-        query = query.where(ProfessionalSchedule.medico_id == doctor_id)
-    result = []
-    for item in db.scalars(query.order_by(ProfessionalSchedule.data_horario)).unique():
-        if not db.scalar(
-            select(Appointment).where(
-                Appointment.medico_id == item.medico_id,
-                Appointment.data_horario == item.data_horario,
-                Appointment.status != "cancelado",
-            )
-        ):
-            result.append(
-                AvailableSlot(
-                    doctor_id=item.medico_id,
-                    doctor_name=item.medico.nome,
-                    specialty=specialty,
-                    scheduled_at=item.data_horario,
-                )
-            )
-    return result
-
-
-@app.get("/availability/dates", response_model=list[date])
-def available_dates(
-    specialty: str,
-    doctor_id: int,
-    user: User = Depends(require_roles("paciente")),
-    db: Session = Depends(get_db),
-):
-    return sorted({slot.scheduled_at.date() for slot in available(specialty, doctor_id, user, db)})
-
-
-@app.get("/availability/times", response_model=list[AvailableSlot])
-def available_times(
-    specialty: str,
-    doctor_id: int,
-    day: date,
-    user: User = Depends(require_roles("paciente")),
-    db: Session = Depends(get_db),
-):
-    return [
-        slot for slot in available(specialty, doctor_id, user, db)
-        if slot.scheduled_at.date() == day
     ]
 
 
@@ -784,12 +961,18 @@ def calendar_dates(
     user: User = Depends(require_roles("paciente")),
     db: Session = Depends(get_db),
 ):
+    from app.routes.admin import is_holiday
+    from app.services.appointments import active_booking_link
+
+    if not active_booking_link(db, doctor_id, specialty):
+        return []
     rows = db.scalars(
         select(ProfessionalSchedule).where(
             ProfessionalSchedule.medico_id == doctor_id,
-            func.lower(ProfessionalSchedule.especialidade)
-            == specialty.strip().lower(),
-            ProfessionalSchedule.data_horario > datetime.now(),
+            func.lower(func.trim(ProfessionalSchedule.especialidade))
+            == canonical_specialty_name(specialty).lower(),
+            ProfessionalSchedule.data_horario > clock.now_sao_paulo_naive(),
+            ProfessionalSchedule.bloqueado.is_(False),
         )
     )
     return sorted(
@@ -797,8 +980,14 @@ def calendar_dates(
             row.data_horario.date()
             for row in rows
             if row.data_horario.weekday() < 5
+            and not is_holiday(row.data_horario.date())
             and row.data_horario.hour in GENERAL_HOURS
             and row.data_horario.minute == 0
+            and not db.scalar(select(Appointment.id).where(
+                Appointment.medico_id == doctor_id,
+                Appointment.data_horario == row.data_horario,
+                Appointment.status != "cancelado",
+            ))
         }
     )
 
@@ -811,9 +1000,14 @@ def calendar_times(
     user: User = Depends(require_roles("paciente")),
     db: Session = Depends(get_db),
 ):
+    from app.routes.admin import is_holiday
+    from app.services.appointments import active_booking_link
+
     if (
-        day < date.today()
+        day < clock.today_sao_paulo()
         or day.weekday() >= 5
+        or is_holiday(day)
+        or not active_booking_link(db, doctor_id, specialty)
     ):
         return []
     start = datetime.combine(day, datetime.min.time())
@@ -823,11 +1017,11 @@ def calendar_times(
             select(ProfessionalSchedule)
             .where(
                 ProfessionalSchedule.medico_id == doctor_id,
-                func.lower(ProfessionalSchedule.especialidade)
-                == specialty.strip().lower(),
+                func.lower(func.trim(ProfessionalSchedule.especialidade))
+                == canonical_specialty_name(specialty).lower(),
                 ProfessionalSchedule.data_horario >= start,
                 ProfessionalSchedule.data_horario < end,
-                ProfessionalSchedule.data_horario > datetime.now(),
+                ProfessionalSchedule.data_horario > clock.now_sao_paulo_naive(),
             )
             .order_by(ProfessionalSchedule.data_horario)
         )
@@ -870,7 +1064,7 @@ def calendar_times(
     return result
 
 
-@app.get("/appointments/{appointment_id}", response_model=AppointmentResponse, response_model_exclude_none=True)
+@app.get("/appointments/{appointment_id:int}", response_model=AppointmentResponse, response_model_exclude_none=True)
 def appointment_detail(
     appointment_id: int,
     user: User = Depends(require_roles("paciente")),
@@ -880,16 +1074,26 @@ def appointment_detail(
 
 
 def slot_free(db: Session, doctor_id: int, at: datetime, specialty: str) -> None:
-    if at.tzinfo is not None or at <= datetime.now():
+    from app.routes.admin import is_holiday
+    from app.services.appointments import active_booking_link
+
+    if at.tzinfo is not None or at <= clock.now_sao_paulo_naive():
         raise HTTPException(422, "Informe um horário local futuro")
     if at.weekday() >= 5:
         raise HTTPException(422, "Atendimento permitido somente de segunda a sexta")
+    if is_holiday(at.date()):
+        raise HTTPException(422, "Atendimento não permitido em feriado nacional")
     if at.minute != 0 or at.second != 0 or at.microsecond != 0 or at.hour not in GENERAL_HOURS:
         raise HTTPException(422, "Horário permitido: 07h–11h ou 13h–17h")
+    if not active_booking_link(db, doctor_id, specialty):
+        raise HTTPException(
+            422,
+            "Profissional ou especialidade não está ativo e vinculado para agendamento.",
+        )
     slot = db.scalar(
         select(ProfessionalSchedule).where(
-            func.lower(ProfessionalSchedule.especialidade)
-            == specialty.strip().lower(),
+            func.lower(func.trim(ProfessionalSchedule.especialidade))
+            == canonical_specialty_name(specialty).lower(),
             ProfessionalSchedule.medico_id == doctor_id,
             ProfessionalSchedule.data_horario == at,
             ProfessionalSchedule.bloqueado.is_(False),
@@ -915,14 +1119,28 @@ def create_appointment(
     db.execute(text("BEGIN IMMEDIATE"))
     if payload.scheduled_at.tzinfo:
         raise HTTPException(422, "Informe horário local sem fuso")
-    if user.e_menor_idade and not db.scalar(
-        select(PatientGuardian).where(PatientGuardian.paciente_id == user.id)
-    ):
-        raise HTTPException(409, "Menor deve possuir responsável vinculado")
+    from app.services.appointments import full_age
+    age = full_age(user.data_nascimento) if user.data_nascimento else None
+    if user.e_menor_idade or (age is not None and age < 18):
+        guardian = db.scalar(
+            select(Guardian)
+            .join(PatientGuardian, PatientGuardian.responsavel_id == Guardian.id)
+            .where(PatientGuardian.paciente_id == user.id)
+        )
+        if (
+            not guardian
+            or not valid_name(guardian.nome)
+            or not valid_cpf(digits(guardian.cpf))
+        ):
+            raise HTTPException(
+                409,
+                "Menor deve possuir responsável legal com nome e CPF válidos vinculado",
+            )
     duplicate = db.scalar(
         select(Appointment).where(
             Appointment.paciente_id == user.id,
-            func.lower(Appointment.especialidade) == payload.specialty.strip().lower(),
+            func.lower(func.trim(Appointment.especialidade))
+            == canonical_specialty_name(payload.specialty).lower(),
             func.date(Appointment.data_horario) == payload.scheduled_at.date(),
             Appointment.status.not_in(["cancelado", "concluido", "falta"]),
         )
@@ -954,7 +1172,6 @@ def owned(db: Session, appointment_id: int, user: User) -> Appointment:
     return item
 
 
-@app.put("/appointments/{appointment_id}/cancel", response_model=AppointmentResponse, response_model_exclude_none=True)
 @app.post("/appointments/{appointment_id}/cancel", response_model=AppointmentResponse, response_model_exclude_none=True)
 def cancel(
     appointment_id: int,
@@ -966,11 +1183,16 @@ def cancel(
         raise HTTPException(
             409, "Somente consultas agendadas podem ser canceladas ou reagendadas"
         )
-    if item.data_horario - datetime.now() < timedelta(hours=24):
+    if item.data_horario - clock.now_sao_paulo_naive() < timedelta(hours=24):
         raise HTTPException(
             409, "Cancelamento permitido apenas com 24 horas de antecedência."
         )
+    from app.services.appointments import record_audit_event
+    previous_status = item.status
     item.status = "cancelado"
+    record_audit_event(db, user, "consulta_cancelada", "consulta", item.id, {
+        "status_anterior": previous_status, "status_novo": item.status,
+    })
     db.commit()
     db.refresh(item)
     result = as_appointment(item)
@@ -978,9 +1200,6 @@ def cancel(
     return result
 
 
-@app.put(
-    "/appointments/{appointment_id}/reschedule", response_model=AppointmentResponse, response_model_exclude_none=True
-)
 @app.post(
     "/appointments/{appointment_id}/reschedule", response_model=AppointmentResponse, response_model_exclude_none=True
 )
@@ -998,9 +1217,10 @@ def reschedule(
     db.execute(text("BEGIN IMMEDIATE"))
     if payload.scheduled_at.tzinfo:
         raise HTTPException(422, "Informe horário local sem fuso")
-    if item.data_horario - datetime.now() < timedelta(
+    now = clock.now_sao_paulo_naive()
+    if item.data_horario - now < timedelta(
         hours=12
-    ) or payload.scheduled_at - datetime.now() < timedelta(hours=12):
+    ) or payload.scheduled_at - now < timedelta(hours=12):
         raise HTTPException(
             409, "Reagendamento exige antecedência mínima de 12 horas (RN03)"
         )
@@ -1016,11 +1236,23 @@ def reschedule(
     if duplicate:
         raise HTTPException(409, "Já existe consulta ativa desta especialidade para o paciente")
     slot_free(db, payload.doctor_id, payload.scheduled_at, item.especialidade)
+    from app.services.appointments import record_audit_event
+    previous_doctor_id = item.medico_id
+    previous_scheduled_at = item.data_horario
+    previous_status = item.status
     item.medico_id, item.data_horario, item.status = (
         payload.doctor_id,
         payload.scheduled_at,
         "agendado",
     )
+    record_audit_event(db, user, "consulta_reagendada", "consulta", item.id, {
+        "status_anterior": previous_status,
+        "status_novo": item.status,
+        "medico_anterior_id": previous_doctor_id,
+        "medico_novo_id": item.medico_id,
+        "horario_anterior": previous_scheduled_at.isoformat(),
+        "horario_novo": item.data_horario.isoformat(),
+    })
     db.commit()
     db.refresh(item)
     return as_appointment(item)

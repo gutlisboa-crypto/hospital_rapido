@@ -103,6 +103,12 @@ class ApiService {
   Future<List<Map<String, dynamic>>> professionals(String specialty) async =>
       _list(await _request('GET',
           '/professionals?specialty=${Uri.encodeQueryComponent(specialty)}'));
+  Future<List<Map<String, dynamic>>> bookingProfessionals() async =>
+      _list(await _request('GET', '/professionals'));
+  Future<List<Map<String, dynamic>>> specialtiesForProfessional(
+          int professionalId) async =>
+      _list(await _request(
+          'GET', '/specialties?professional_id=$professionalId'));
   Future<List<DateTime>> availableDates(String specialty, int doctorId) async =>
       (jsonDecode((await _request('GET',
                   '/availability/calendar-dates?specialty=${Uri.encodeQueryComponent(specialty)}&doctor_id=$doctorId'))
@@ -115,13 +121,25 @@ class ApiService {
               '/availability/calendar-times?specialty=${Uri.encodeQueryComponent(specialty)}&doctor_id=$doctorId&day=${day.toIso8601String().substring(0, 10)}'))
           .map(Slot.fromJson)
           .toList();
-  Future<List<Map<String, dynamic>>> queue() async =>
-      _list(await _request('GET', '/queue'));
-  Future<List<Slot>> slots(String specialty, {int? doctorId}) async =>
-      _list(await _request('GET',
-              '/available-slots?specialty=${Uri.encodeQueryComponent(specialty)}${doctorId == null ? '' : '&doctor_id=$doctorId'}'))
-          .map(Slot.fromJson)
-          .toList();
+  Future<List<Map<String, dynamic>>> queue(
+      {DateTime? day,
+      String? specialty,
+      int? professionalId,
+      String? status,
+      String? risk,
+      String? patient}) async {
+    final query = <String, String>{
+      'day': _day(day ?? DateTime.now()),
+      if (specialty?.trim().isNotEmpty ?? false) 'specialty': specialty!.trim(),
+      if (professionalId != null) 'professional_id': '$professionalId',
+      if (status?.trim().isNotEmpty ?? false) 'status': status!.trim(),
+      if (risk?.trim().isNotEmpty ?? false) 'risk': risk!.trim(),
+      if (patient?.trim().isNotEmpty ?? false) 'patient': patient!.trim(),
+    };
+    return _list(
+        await _request('GET', '/queue?${Uri(queryParameters: query).query}'));
+  }
+
   Future<void> book(Slot s) async {
     await _post('/appointments', {
       'doctor_id': s.doctorId,
@@ -186,11 +204,18 @@ class ApiService {
 
   Future<void> changeStatus(int id, String status,
       {String? risk, String? triage}) async {
-    await _request('PUT', '/appointments/$id/status', {
-      'status': status,
-      if (risk != null) 'risk': risk,
-      if (triage != null) 'triage': triage
-    });
+    switch (status) {
+      case 'em_espera':
+        return receptionCheckIn(id);
+      case 'em_triagem':
+        return classifyRisk(id, risk!, triage!, triage, null);
+      case 'em_atendimento':
+        return startCare(id);
+      case 'concluido':
+        return completeCare(id);
+      default:
+        throw const ApiException('Transição de atendimento inválida.');
+    }
   }
 
   Future<List<Map<String, dynamic>>> specialties() async =>
@@ -242,12 +267,14 @@ class ApiService {
       String? specialty,
       int? professionalId,
       String? status,
+      String? risk,
       String? patient}) async {
     final query = <String, String>{
       'day': _day(day ?? DateTime.now()),
       if (specialty != null && specialty.isNotEmpty) 'specialty': specialty,
       if (professionalId != null) 'professional_id': '$professionalId',
       if (status != null && status.isNotEmpty) 'status': status,
+      if (risk != null && risk.isNotEmpty) 'risk': risk,
       if (patient != null && patient.trim().isNotEmpty)
         'patient': patient.trim(),
     };
@@ -301,6 +328,14 @@ class ApiService {
     await _request('PATCH', '/recepcao/agendamentos/$id/nao-compareceu', {});
   }
 
+  Future<void> receptionValidatePriorityCondition(
+      int appointmentId, String condition, String status) async {
+    await _request(
+        'PATCH',
+        '/recepcao/agendamentos/$appointmentId/condicoes/$condition/validacao',
+        {'status': status});
+  }
+
   Future<Map<String, dynamic>> nursingSummary([DateTime? day]) async =>
       jsonDecode((await _request(
               'GET', '/enfermagem/resumo?day=${_day(day ?? DateTime.now())}'))
@@ -337,13 +372,12 @@ class ApiService {
   }
 
   Future<void> startCare(int id) async {
-    await _request(
-        'PATCH', '/profissional/agendamentos/$id/iniciar-atendimento', {});
+    await _request('PATCH', '/medico/atendimentos/$id/iniciar', {});
   }
 
   Future<void> completeCare(int id) async {
-    await _request(
-        'PATCH', '/profissional/agendamentos/$id/concluir-atendimento', {});
+    await _request('PATCH', '/medico/atendimentos/$id/concluir',
+        {'summary': 'Atendimento concluído pelo painel profissional.'});
   }
 
   Future<List<MedicalAppointment>> medicalQueue() async =>
@@ -389,17 +423,16 @@ class ApiService {
           '/admin/medicos/$id/${active ? 'activate' : 'deactivate'}', {}));
 
   Future<List<AdminAppointment>> professionalQueue([DateTime? day]) async =>
-      _list(await _request(
-              'GET', '/profissional/fila?day=${_day(day ?? DateTime.now())}'))
+      _list(await _request('GET', '/medico/fila'))
           .map(AdminAppointment.fromJson)
           .toList();
 
   Future<Map<String, dynamic>> professionalDetails(int id) async =>
-      jsonDecode((await _request('GET', '/profissional/agendamentos/$id')).body)
+      jsonDecode((await _request('GET', '/medico/atendimentos/$id')).body)
           as Map<String, dynamic>;
 
   Future<void> callPatient(int id) async {
-    await _request('PATCH', '/profissional/agendamentos/$id/chamar', {});
+    await _request('PATCH', '/medico/atendimentos/$id/chamar', {});
   }
 
   Future<Map<String, dynamic>> adminAppointmentDetails(int id) async =>
@@ -408,6 +441,9 @@ class ApiService {
 
   Future<List<Map<String, dynamic>>> auditHistory() async =>
       _list(await _request('GET', '/admin/audit'));
+
+  Future<List<Map<String, dynamic>>> priorityValidations() async =>
+      _list(await _request('GET', '/admin/priority-validations'));
 
   Future<List<Map<String, dynamic>>> grids() async =>
       _list(await _request('GET', '/admin/grids'));
@@ -435,7 +471,7 @@ class ApiService {
       _post('/admin/specialties/$id/${active ? 'activate' : 'deactivate'}', {});
 
   Future<List<Map<String, dynamic>>> allProfessionals() async =>
-      _list(await _request('GET', '/professionals'));
+      _list(await _request('GET', '/admin/schedule-professionals'));
 
   String _day(DateTime value) => value.toIso8601String().substring(0, 10);
   List<Map<String, dynamic>> _list(http.Response r) {

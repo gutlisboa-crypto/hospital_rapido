@@ -72,7 +72,13 @@ class _MedicalDashboardState extends State<MedicalDashboard> {
     final completed = await showDialog<bool>(
         context: context,
         builder: (_) => _MedicalCareDialog(api: api, appointment: details));
-    if (completed == true) await load();
+    if (completed == true) {
+      await load();
+      if (mounted) {
+        notice(context,
+            'Atendimento concluído com sucesso. Status da consulta: Concluída.');
+      }
+    }
   }
 
   @override
@@ -148,47 +154,57 @@ class _MedicalQueueCard extends StatelessWidget {
     final time =
         '${item.scheduledAt.hour.toString().padLeft(2, '0')}:${item.scheduledAt.minute.toString().padLeft(2, '0')}';
     final inCare = item.status == 'em_atendimento';
-    return AppSurfaceCard(
-        child:
-            Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Icon(inCare ? Icons.medical_services_outlined : Icons.schedule,
-            color: inCare ? green : blue),
-        const SizedBox(width: AppSpacing.md),
-        Expanded(
-            child:
-                Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text(item.patient,
-              style: Theme.of(context)
-                  .textTheme
-                  .titleMedium
-                  ?.copyWith(fontWeight: FontWeight.w800)),
-          Text('$time • ${item.specialty}'),
-        ])),
-      ]),
-      const SizedBox(height: AppSpacing.md),
-      Wrap(spacing: 8, runSpacing: 8, children: [
-        Chip(
-            avatar: const Icon(Icons.health_and_safety_outlined, size: 18),
-            label: Text('Risco: ${item.riskLabel}')),
-        Chip(
-            avatar: const Icon(Icons.priority_high, size: 18),
-            label: Text('Prioridade: ${item.priorityReason}')),
-        Chip(
-            avatar: Icon(inCare ? Icons.play_circle : Icons.hourglass_top,
-                size: 18),
-            label: Text(inCare ? 'Em atendimento' : 'Aguardando Médico')),
-      ]),
-      const SizedBox(height: AppSpacing.md),
-      Align(
-          alignment: Alignment.centerRight,
-          child: FilledButton.icon(
-              onPressed: onOpen,
-              icon:
-                  Icon(inCare ? Icons.description_outlined : Icons.play_arrow),
-              label: Text(
-                  inCare ? 'Continuar atendimento' : 'Iniciar atendimento')))
-    ]));
+    return Semantics(
+      container: true,
+      explicitChildNodes: true,
+      label:
+          'Paciente ${item.patient}. Horário $time. Especialidade ${specialtyDisplayName(item.specialty)}. ${RiskClassification.resolve(item.risk).semanticLabel}. Prioridade ${item.priorityReason}. Status ${inCare ? 'Em atendimento' : 'Aguardando médico'}',
+      child: AppSurfaceCard(
+          child:
+              Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Icon(inCare ? Icons.medical_services_outlined : Icons.schedule,
+              color: inCare ? green : blue),
+          const SizedBox(width: AppSpacing.md),
+          Expanded(
+              child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                Text(item.patient,
+                    style: Theme.of(context)
+                        .textTheme
+                        .titleMedium
+                        ?.copyWith(fontWeight: FontWeight.w800)),
+                Text('$time • ${specialtyDisplayName(item.specialty)}'),
+              ])),
+        ]),
+        const SizedBox(height: AppSpacing.md),
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          AppRiskIndicator(risk: item.risk),
+          Chip(
+              avatar: const Icon(Icons.priority_high, size: 18),
+              label: Text('Prioridade: ${item.priorityReason}')),
+          Chip(
+              avatar: Icon(inCare ? Icons.play_circle : Icons.hourglass_top,
+                  size: 18),
+              label: Text(inCare ? 'Em atendimento' : 'Aguardando Médico')),
+        ]),
+        const SizedBox(height: AppSpacing.md),
+        Align(
+            alignment: Alignment.centerRight,
+            child: Semantics(
+                button: true,
+                label: inCare ? 'Continuar atendimento' : 'Iniciar atendimento',
+                excludeSemantics: true,
+                child: FilledButton.icon(
+                    onPressed: onOpen,
+                    icon: Icon(
+                        inCare ? Icons.description_outlined : Icons.play_arrow),
+                    label: Text(inCare
+                        ? 'Continuar atendimento'
+                        : 'Iniciar atendimento'))))
+      ])),
+    );
   }
 }
 
@@ -214,10 +230,15 @@ class _MedicalCareDialogState extends State<_MedicalCareDialog> {
   }
 
   Future<void> _start() async {
+    if (working) return;
     setState(() => working = true);
     try {
       appointment = await widget.api.startMedicalCare(appointment.id);
-      if (mounted) setState(() {});
+      if (mounted) {
+        setState(() {});
+        notice(context,
+            'Atendimento iniciado com sucesso. Status da consulta: Em atendimento.');
+      }
     } on ApiException catch (e) {
       if (mounted) notice(context, e.message);
     } finally {
@@ -226,7 +247,11 @@ class _MedicalCareDialogState extends State<_MedicalCareDialog> {
   }
 
   Future<void> _complete() async {
-    if (!formKey.currentState!.validate()) return;
+    if (working) return;
+    if (!formKey.currentState!.validate()) {
+      announceImportant(context, 'Informe o resumo do atendimento.');
+      return;
+    }
     setState(() => working = true);
     try {
       await widget.api.completeMedicalCare(appointment.id, summary.text);
@@ -252,10 +277,12 @@ class _MedicalCareDialogState extends State<_MedicalCareDialog> {
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
                         Text('Idade: ${appointment.age ?? 'não informada'}'),
-                        Text('Especialidade: ${appointment.specialty}'),
-                        Text('Prioridade: ${appointment.priorityReason}'),
                         Text(
-                            'Classificação de risco: ${appointment.riskLabel}'),
+                            'Especialidade: ${specialtyDisplayName(appointment.specialty)}'),
+                        Text('Prioridade: ${appointment.priorityReason}'),
+                        Align(
+                            alignment: Alignment.centerLeft,
+                            child: AppRiskIndicator(risk: appointment.risk)),
                         const Divider(height: 32),
                         Text('Queixa principal',
                             style: Theme.of(context).textTheme.titleMedium),
@@ -272,18 +299,23 @@ class _MedicalCareDialogState extends State<_MedicalCareDialog> {
                         ],
                         if (started) ...[
                           const SizedBox(height: AppSpacing.lg),
-                          TextFormField(
-                              key: const Key('medical-care-summary'),
-                              controller: summary,
-                              minLines: 3,
-                              maxLines: 6,
-                              maxLength: 2000,
-                              decoration: const InputDecoration(
-                                  labelText: 'Resumo do atendimento'),
-                              validator: (value) =>
-                                  (value ?? '').trim().length < 3
-                                      ? 'Informe o resumo do atendimento.'
-                                      : null),
+                          Semantics(
+                              textField: true,
+                              label: 'Resumo do atendimento, obrigatório',
+                              child: TextFormField(
+                                  key: const Key('medical-care-summary'),
+                                  controller: summary,
+                                  autovalidateMode:
+                                      AutovalidateMode.onUserInteraction,
+                                  minLines: 3,
+                                  maxLines: 6,
+                                  maxLength: 2000,
+                                  decoration: const InputDecoration(
+                                      labelText: 'Resumo do atendimento'),
+                                  validator: (value) =>
+                                      (value ?? '').trim().length < 3
+                                          ? 'Informe o resumo do atendimento.'
+                                          : null)),
                         ]
                       ])))),
       actions: [
@@ -291,15 +323,21 @@ class _MedicalCareDialogState extends State<_MedicalCareDialog> {
             onPressed: working ? null : () => Navigator.pop(context),
             child: const Text('Fechar')),
         if (!started)
-          FilledButton.icon(
-              onPressed: working ? null : _start,
-              icon: const Icon(Icons.play_arrow),
-              label: const Text('Iniciar atendimento'))
+          Semantics(
+              button: true,
+              label: 'Iniciar atendimento',
+              child: FilledButton.icon(
+                  onPressed: working ? null : _start,
+                  icon: const Icon(Icons.play_arrow),
+                  label: const Text('Iniciar atendimento')))
         else
-          FilledButton.icon(
-              onPressed: working ? null : _complete,
-              icon: const Icon(Icons.check_circle_outline),
-              label: const Text('Concluir atendimento')),
+          Semantics(
+              button: true,
+              label: 'Concluir atendimento',
+              child: FilledButton.icon(
+                  onPressed: working ? null : _complete,
+                  icon: const Icon(Icons.check_circle_outline),
+                  label: const Text('Concluir atendimento'))),
       ],
     );
   }

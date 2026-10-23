@@ -1,14 +1,14 @@
 part of '../main.dart';
 
 class AccessibilityState extends ChangeNotifier {
-  bool highContrast = false, screenReaderSupport = true;
+  bool highContrast = false, screenReaderSupport = false;
   double fontSizeScale = 1.0;
 
   Color get pageBackground => highContrast ? Colors.black : pageBackgroundColor;
   Future<void> load() async {
     final prefs = await SharedPreferences.getInstance();
     highContrast = prefs.getBool('ubs_high_contrast') ?? false;
-    screenReaderSupport = prefs.getBool('ubs_screen_reader') ?? true;
+    screenReaderSupport = prefs.getBool('ubs_screen_reader') ?? false;
     fontSizeScale = prefs.getDouble('ubs_font_scale') ?? 1.0;
   }
 

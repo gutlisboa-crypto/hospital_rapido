@@ -97,12 +97,12 @@ void _expectContrast(WidgetTester tester, {required bool enabled}) {
   expect(
       scaffold.backgroundColor, enabled ? Colors.black : pageBackgroundColor);
 
-  final painter = tester
+  final painters = tester
       .widgetList<CustomPaint>(find.byType(CustomPaint))
       .map((widget) => widget.painter)
       .whereType<WavePainter>()
-      .single;
-  expect(painter.highContrast, enabled);
+      .toList();
+  expect(painters.every((painter) => painter.highContrast == enabled), isTrue);
 
   final theme = Theme.of(tester.element(find.byType(Scaffold).first));
   expect(theme.scaffoldBackgroundColor,

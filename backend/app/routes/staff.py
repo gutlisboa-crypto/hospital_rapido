@@ -9,30 +9,32 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.core import clock
+from app.core.risk import RISK_LABELS, RiskLevel
+from app.core.specialty import canonical_specialty_name
 from app.core.security import require_roles
 from app.services.appointments import (
     legal_priority_code,
     legal_priority_label,
     queue_sort_key,
+    record_audit_event,
+    register_manual_absence,
 )
 from app.models import (
     Appointment,
     AppointmentStatusHistory,
+    PriorityCondition,
+    PriorityConditionHistory,
     ProfessionalProfile,
     RiskClassification,
     User,
 )
+from app.schemas import PriorityValidationInput
 
 router = APIRouter(tags=["recepção e enfermagem"])
 
-RISK_LABELS = {
-    "muito_alto": "Muito alto",
-    "alto": "Alto",
-    "medio": "Médio",
-    "baixo": "Baixo",
-}
 class RiskInput(BaseModel):
-    level: Literal["muito_alto", "alto", "medio", "baixo"]
+    level: RiskLevel
     complaint: str = Field(min_length=3, max_length=500)
     vital_signs: str = Field(min_length=3, max_length=500)
     observation: str | None = Field(default=None, max_length=500)
@@ -58,7 +60,7 @@ def _appointment_payload(db: Session, row: Appointment) -> dict:
         "scheduled_at": row.data_horario,
         "patient": row.paciente.nome,
         "patient_document": _mask_cpf(row.paciente.cpf),
-        "specialty": row.especialidade,
+        "specialty": canonical_specialty_name(row.especialidade),
         "professional": row.medico.nome,
         "professional_id": row.medico_id,
         "status": row.status,
@@ -77,6 +79,21 @@ def _appointment_payload(db: Session, row: Appointment) -> dict:
         "called_at": row.chamado_em,
         "started_at": row.iniciado_em,
         "completed_at": row.concluido_em,
+        "priority_conditions": [
+            {
+                "condition": item.condicao,
+                "status": item.status,
+                "reported_at": item.informada_em,
+                "validated_at": item.validada_em,
+                "validated_by": (
+                    item.responsavel_validacao.nome if item.responsavel_validacao else None
+                ),
+            }
+            for item in sorted(
+                row.paciente.condicoes_prioritarias, key=lambda value: value.condicao
+            )
+            if item.status != "retirada"
+        ],
     }
 
 
@@ -130,7 +147,10 @@ def _filtered_day_query(
         Appointment.data_horario >= start, Appointment.data_horario < end
     )
     if specialty:
-        query = query.where(func.lower(Appointment.especialidade) == specialty.lower())
+        query = query.where(
+            func.lower(func.trim(Appointment.especialidade))
+            == canonical_specialty_name(specialty).lower()
+        )
     if professional_id:
         query = query.where(Appointment.medico_id == professional_id)
     if status:
@@ -149,7 +169,7 @@ def _filtered_day_query(
 
 @router.get("/recepcao/resumo")
 def reception_summary(
-    day: date = Query(default_factory=date.today),
+    day: date = Query(default_factory=clock.today_sao_paulo),
     actor: User = Depends(require_roles("recepcao")),
     db: Session = Depends(get_db),
 ):
@@ -172,7 +192,7 @@ def reception_summary(
 
 @router.get("/recepcao/agendamentos")
 def reception_appointments(
-    day: date = Query(default_factory=date.today),
+    day: date = Query(default_factory=clock.today_sao_paulo),
     specialty: str | None = None,
     professional_id: int | None = None,
     status: str | None = None,
@@ -202,16 +222,18 @@ def reception_check_in(
     db: Session = Depends(get_db),
 ):
     row = _appointment_or_404(db, appointment_id)
-    if row.data_horario.date() != date.today():
+    if row.data_horario.date() != clock.today_sao_paulo():
         raise HTTPException(409, "Check-in permitido somente no dia da consulta")
     if row.status != "agendado" or row.chegada_em:
         raise HTTPException(409, "Consulta já recebeu check-in ou possui status incompatível")
-    row.chegada_em = datetime.now()
+    row.chegada_em = clock.now_sao_paulo_naive()
     row.chegada_por = actor.id
     _record_status(db, row, "em_espera", actor)
+    record_audit_event(db, actor, "chegada_confirmada", "consulta", row.id, {
+        "status_anterior": "agendado", "status_novo": "em_espera",
+    })
     db.commit()
     return _appointment_payload(db, row)
-
 
 @router.patch("/recepcao/agendamentos/{appointment_id}/nao-compareceu")
 def reception_absence(
@@ -220,19 +242,60 @@ def reception_absence(
     db: Session = Depends(get_db),
 ):
     row = _appointment_or_404(db, appointment_id)
-    if row.data_horario.date() != date.today():
-        raise HTTPException(409, "A ausência só pode ser registrada no dia da consulta")
-    if row.status not in {"agendado", "em_espera"}:
-        raise HTTPException(409, "Consulta em atendimento ou concluída não pode receber ausência")
-    row.falta_em = datetime.now()
-    _record_status(db, row, "falta", actor)
+    register_manual_absence(db, row, actor)
+    return _appointment_payload(db, row)
+
+
+@router.patch(
+    "/recepcao/agendamentos/{appointment_id}/condicoes/{condition_name}/validacao"
+)
+def validate_priority_condition(
+    appointment_id: int,
+    condition_name: Literal["pcd", "gestante", "lactante"],
+    payload: PriorityValidationInput,
+    actor: User = Depends(require_roles("recepcao")),
+    db: Session = Depends(get_db),
+):
+    row = _appointment_or_404(db, appointment_id)
+    condition = db.scalar(select(PriorityCondition).where(
+        PriorityCondition.paciente_id == row.paciente_id,
+        PriorityCondition.condicao == condition_name,
+    ))
+    if not condition:
+        raise HTTPException(404, "Condição prioritária não informada pelo paciente")
+    previous = condition.status
+    if previous == payload.status:
+        return _appointment_payload(db, row)
+    now = clock.now_sao_paulo_naive()
+    condition.status = payload.status
+    condition.validada_por = actor.id
+    condition.validada_em = now
+    db.add(PriorityConditionHistory(
+        condicao_prioritaria_id=condition.id,
+        status_anterior=previous,
+        status_novo=payload.status,
+        alterado_por=actor.id,
+        criado_em=clock.now_utc_naive(),
+    ))
+    record_audit_event(
+        db,
+        actor,
+        "validar_condicao_prioritaria",
+        "condicao_prioritaria",
+        condition.id,
+        {
+            "condicao": condition_name,
+            "status_anterior": previous,
+            "status_novo": payload.status,
+        },
+    )
     db.commit()
     return _appointment_payload(db, row)
 
 
 @router.get("/enfermagem/resumo")
 def nursing_summary(
-    day: date = Query(default_factory=date.today),
+    day: date = Query(default_factory=clock.today_sao_paulo),
     actor: User = Depends(require_roles("enfermagem")),
     db: Session = Depends(get_db),
 ):
@@ -264,7 +327,7 @@ def nursing_summary(
 
 @router.get("/enfermagem/fila")
 def nursing_queue(
-    day: date = Query(default_factory=date.today),
+    day: date = Query(default_factory=clock.today_sao_paulo),
     specialty: str | None = None,
     status: str | None = None,
     risk: str | None = None,
@@ -317,7 +380,7 @@ def classify_risk(
         raise HTTPException(409, "Não é possível classificar risco sem check-in")
     if row.status not in {"em_espera", "em_triagem"}:
         raise HTTPException(409, "Classificação incompatível com o status atual")
-    now = datetime.now()
+    now = clock.now_sao_paulo_naive()
     record = _risk_record(db, row.id)
     if record:
         record.nivel_risco = payload.level
@@ -348,84 +411,13 @@ def classify_risk(
     row.triagem_dados = "\n".join(triage_parts)
     row.triagem_por = actor.id
     row.triagem_em = now
+    previous_status = row.status
     if row.status == "em_espera":
         _record_status(db, row, "em_triagem", actor)
+    record_audit_event(db, actor, "triagem_registrada", "consulta", row.id, {
+        "status_anterior": previous_status, "status_novo": row.status,
+    })
     db.commit()
     return _appointment_payload(db, row)
 
-
-@router.get("/profissional/fila")
-def professional_queue(
-    day: date = Query(default_factory=date.today),
-    actor: User = Depends(require_roles("profissional")),
-    db: Session = Depends(get_db),
-):
-    query = _filtered_day_query(day, None, actor.id, None, None).where(
-        Appointment.status.in_(["em_triagem", "em_atendimento"])
-    )
-    rows = list(db.scalars(query).unique())
-    return [_appointment_payload(db, row) for row in sorted(rows, key=queue_sort_key)]
-
-
-@router.get("/profissional/agendamentos/{appointment_id}")
-def professional_details(
-    appointment_id: int,
-    actor: User = Depends(require_roles("profissional")),
-    db: Session = Depends(get_db),
-):
-    row = _appointment_or_404(db, appointment_id)
-    if row.medico_id != actor.id:
-        raise HTTPException(403, "Acesso permitido apenas aos atendimentos atribuídos")
-    return _appointment_payload(db, row)
-
-
-@router.patch("/profissional/agendamentos/{appointment_id}/chamar")
-def call_patient(
-    appointment_id: int,
-    actor: User = Depends(require_roles("profissional")),
-    db: Session = Depends(get_db),
-):
-    row = _appointment_or_404(db, appointment_id)
-    if row.medico_id != actor.id:
-        raise HTTPException(403, "Acesso permitido apenas aos atendimentos atribuídos")
-    if row.status != "em_triagem" or not row.classificacao_risco:
-        raise HTTPException(409, "Paciente ainda não foi encaminhado pela triagem")
-    row.chamado_em = datetime.now()
-    db.commit()
-    return _appointment_payload(db, row)
-
-
-@router.patch("/profissional/agendamentos/{appointment_id}/iniciar-atendimento")
-def start_care(
-    appointment_id: int,
-    actor: User = Depends(require_roles("profissional")),
-    db: Session = Depends(get_db),
-):
-    row = _appointment_or_404(db, appointment_id)
-    if row.medico_id != actor.id:
-        raise HTTPException(403, "Acesso permitido apenas aos atendimentos atribuídos")
-    if not row.chegada_em:
-        raise HTTPException(409, "Não é possível iniciar atendimento sem check-in")
-    if row.status != "em_triagem" or not row.classificacao_risco:
-        raise HTTPException(409, "Conclua a classificação de risco antes do atendimento")
-    row.iniciado_em = datetime.now()
-    _record_status(db, row, "em_atendimento", actor)
-    db.commit()
-    return _appointment_payload(db, row)
-
-
-@router.patch("/profissional/agendamentos/{appointment_id}/concluir-atendimento")
-def complete_care(
-    appointment_id: int,
-    actor: User = Depends(require_roles("profissional")),
-    db: Session = Depends(get_db),
-):
-    row = _appointment_or_404(db, appointment_id)
-    if row.medico_id != actor.id:
-        raise HTTPException(403, "Acesso permitido apenas aos atendimentos atribuídos")
-    if row.status != "em_atendimento":
-        raise HTTPException(409, "Somente consulta em atendimento pode ser concluída")
-    row.concluido_em = datetime.now()
-    _record_status(db, row, "concluido", actor)
-    db.commit()
-    return _appointment_payload(db, row)
+# Fim das rotas oficiais da recepção e da enfermagem.

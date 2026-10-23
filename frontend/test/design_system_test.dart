@@ -32,6 +32,47 @@ void main() {
         greaterThanOrEqualTo(48));
   });
 
+  testWidgets('botões compartilhados expõem estados legíveis e consistentes',
+      (tester) async {
+    await tester.pumpWidget(UbsApp(
+      home: Scaffold(
+        body: Column(children: [
+          AppActionButton(label: 'Primário', onPressed: () {}),
+          const AppActionButton(label: 'Desabilitado', onPressed: null),
+          const AppActionButton(
+              label: 'Excluir', destructive: true, onPressed: null),
+          OutlinedButton(onPressed: () {}, child: const Text('Secundário')),
+        ]),
+      ),
+    ));
+
+    final theme = Theme.of(tester.element(find.text('Primário')));
+    final primary = theme.filledButtonTheme.style!;
+    final secondary = theme.outlinedButtonTheme.style!;
+    expect(primary.backgroundColor!.resolve({}), blue);
+    expect(primary.foregroundColor!.resolve({}), Colors.white);
+    expect(primary.backgroundColor!.resolve({WidgetState.pressed}),
+        const Color(0xFF00477C));
+    expect(primary.backgroundColor!.resolve({WidgetState.disabled}),
+        const Color(0xFFDCE2E8));
+    expect(primary.foregroundColor!.resolve({WidgetState.disabled}),
+        const Color(0xFF4F5963));
+    expect(primary.side!.resolve({WidgetState.focused})!.width, 3);
+    expect(secondary.backgroundColor!.resolve({}), Colors.white);
+    expect(secondary.backgroundColor!.resolve({WidgetState.hovered}),
+        const Color(0xFFF0F6FC));
+    expect(secondary.backgroundColor!.resolve({WidgetState.pressed}),
+        const Color(0xFFE8F1FF));
+    expect(secondary.side!.resolve({WidgetState.focused})!.width, 3);
+    expect(tester.getSize(find.widgetWithText(FilledButton, 'Primário')).height,
+        greaterThanOrEqualTo(AppSizes.minTouchTarget));
+    expect(
+        tester
+            .getSize(find.widgetWithText(OutlinedButton, 'Secundário'))
+            .height,
+        greaterThanOrEqualTo(AppSizes.minTouchTarget));
+  });
+
   testWidgets('long_empty_state_wraps_at_360px', (tester) async {
     tester.view.physicalSize = const Size(360, 800);
     tester.view.devicePixelRatio = 1;

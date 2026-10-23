@@ -34,8 +34,9 @@ O fluxo presencial é `Recepção/check-in → Enfermagem/triagem → Médico �
 | --- | --- | --- |
 | Administrador | `12345678909` | `Admin@123` |
 | Recepção | `98765432100` | `Recepcao@123` |
-| Enfermagem | `45678912364` | `Enfermagem@123` |
+| Enfermagem | `11144477735` | `Profissional@123` |
 | Médico | `39053344705` | `Medico@123` |
+| Médico — Pediatria | `16899535009` | `Pediatria@123` |
 | Paciente | `52998224725` | `Paciente@123` |
 
 Todos os nomes e dados dessas contas são fictícios e destinados somente à demonstração acadêmica.
@@ -50,7 +51,9 @@ No Windows, execute o único iniciador oficial na raiz:
 INICIAR_TUDO.bat
 ```
 
-O iniciador localiza o projeto, usa ou cria `backend\venv`, valida a configuração, garante de forma idempotente as contas fictícias que estiverem ausentes, inicia a API e abre o Flutter para Windows. O conteúdo do frontend é verificado por SHA-256; quando houver mudança, o aplicativo Windows será recompilado automaticamente. O banco existente não é recriado nem apagado.
+O iniciador localiza o projeto, usa ou cria `backend\venv`, sincroniza as dependências quando `requirements.txt` mudar, valida a configuração, garante de forma idempotente as contas fictícias que estiverem ausentes, inicia a API e abre o Flutter para Windows. O conteúdo do frontend é verificado por SHA-256; quando houver mudança, o aplicativo Windows será recompilado automaticamente. A mensagem de sucesso aparece somente depois que a API responde e o frontend permanece ativo e pronto; em caso de falha ou timeout, o iniciador mostra os logs e retorna erro. O banco existente não é recriado nem apagado.
+
+Ao abrir `INICIAR_TUDO.bat` com duplo clique, o iniciador atualiza as dependências necessárias e recompila o aplicativo Windows antes de abrir, garantindo que a versão exibida contenha as alterações atuais.
 
 Para abrir no navegador, use `INICIAR_TUDO.bat -Dispositivo chrome` ou `INICIAR_TUDO.bat -Dispositivo edge`.
 
@@ -75,7 +78,7 @@ http://127.0.0.1:8000/docs
 - `scripts/`: implementação interna do iniciador oficial;
 - `tests/`: validações do iniciador e da estrutura na raiz;
 - `INICIAR_TUDO.bat`: iniciador oficial;
-- `scripts/iniciar.ps1` e `backend/iniciar_backend.ps1`: scripts internos usados pelo iniciador.
+- `scripts/iniciar-supervisionado.ps1`: script interno usado pelo iniciador oficial.
 
 Consulte o [índice da documentação](docs/README.md) e a [estrutura detalhada](docs/ESTRUTURA_DO_PROJETO.md).
 
@@ -83,7 +86,7 @@ Consulte o [índice da documentação](docs/README.md) e a [estrutura detalhada]
 
 Copie `backend/.env.example` para `backend/.env` quando precisar configurar SMTP. O `.env`, bancos locais, ambientes virtuais, caches e builds são ignorados pelo Git. Nunca publique senha SMTP, `JWT_SECRET_KEY`, tokens, hashes ou bancos com dados locais.
 
-O cadastro público cria somente pacientes e permite o primeiro login imediatamente. As rotas auxiliares de confirmação de e-mail permanecem disponíveis, mas não bloqueiam o cadastro atual. Contas internas são gerenciadas pelo administrador. A recuperação de senha usa código temporário de uso único armazenado somente como hash e exige SMTP configurado para entrega real.
+O cadastro público cria somente pacientes, deixa a conta ativa e não depende do SMTP. O primeiro login é feito normalmente com CPF e senha, sem confirmação obrigatória de e-mail. A recuperação de senha continua usando código temporário de uso único armazenado somente como hash e exige SMTP configurado para entrega real.
 
 ## Escopo do MVP
 

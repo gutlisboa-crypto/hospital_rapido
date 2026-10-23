@@ -12,13 +12,22 @@ class FakePatientApi extends ApiService {
     this.hasAppointment = true,
     this.specialtyName = 'Clínica geral',
     this.professionalName = 'Dra. Ana Souza',
+    this.emptySpecialties = false,
+    this.emptyDates = false,
+    this.availableHours,
   });
   bool hasAppointment;
   final String specialtyName;
   final String professionalName;
+  final bool emptySpecialties;
+  final bool emptyDates;
+  final List<int>? availableHours;
   bool offline = false, expired = false;
   int summaryCalls = 0;
   int bookings = 0;
+  int cancellations = 0;
+  int professionalSpecialtyCalls = 0;
+  int availableTimeCalls = 0;
   Completer<void>? bookingCompleter;
   String status = 'agendado';
   late final at = DateTime.now().add(const Duration(days: 3));
@@ -65,36 +74,75 @@ class FakePatientApi extends ApiService {
   Future<List<Appointment>> appointments() async =>
       hasAppointment ? [item] : [];
   @override
-  Future<List<Map<String, dynamic>>> specialties() async => [
-        {'id': 1, 'name': specialtyName}
-      ];
+  Future<List<Map<String, dynamic>>> specialties() async => emptySpecialties
+      ? []
+      : [
+          {'id': 1, 'name': specialtyName}
+        ];
   @override
   Future<List<Map<String, dynamic>>> professionals(String specialty) async => [
         {'id': 8, 'name': professionalName}
       ];
   @override
+  Future<List<Map<String, dynamic>>> bookingProfessionals() async => [
+        {'id': 8, 'name': professionalName}
+      ];
+  @override
+  Future<List<Map<String, dynamic>>> specialtiesForProfessional(
+      int professionalId) async {
+    professionalSpecialtyCalls++;
+    return [
+      {'id': 1, 'name': specialtyName}
+    ];
+  }
+
+  @override
   Future<List<DateTime>> availableDates(String specialty, int doctorId) async =>
-      [at];
+      emptyDates ? [] : [at];
   @override
   Future<List<Slot>> availableTimes(
-          String specialty, int doctorId, DateTime day) async =>
-      [
-        Slot.fromJson({
-          'doctor_id': 8,
-          'doctor_name': professionalName,
-          'specialty': specialtyName,
-          'scheduled_at': at.toIso8601String()
-        })
-      ];
+      String specialty, int doctorId, DateTime day) async {
+    availableTimeCalls++;
+    return (availableHours ?? [at.hour])
+        .map((hour) => Slot.fromJson({
+              'doctor_id': 8,
+              'doctor_name': professionalName,
+              'specialty': specialtyName,
+              'scheduled_at':
+                  DateTime(at.year, at.month, at.day, hour).toIso8601String()
+            }))
+        .toList();
+  }
+
   @override
   Future<void> book(Slot slot) async {
     bookings++;
     if (bookingCompleter != null) await bookingCompleter!.future;
     hasAppointment = true;
   }
+
+  @override
+  Future<String> cancel(int id) async {
+    cancellations++;
+    status = 'cancelado';
+    return 'Consulta cancelada com sucesso.';
+  }
 }
 
 void main() {
+  test('especialidades usam apresentação canônica sem duplicar opções', () {
+    expect(specialtyDisplayName('Clínica gera'), 'Clínica Geral');
+    expect(specialtyDisplayName('Clínica geral'), 'Clínica Geral');
+    expect(specialtyDisplayName('Clínica Geral'), 'Clínica Geral');
+    expect(specialtyDisplayName('UTI Adulto'), 'UTI Adulto');
+    expect(
+        uniqueSpecialtyOptions([
+          {'id': 1, 'name': 'Clínica gera'},
+          {'id': 2, 'name': 'Clínica Geral'},
+        ]),
+        hasLength(1));
+  });
+
   testWidgets('patient_wide_layout_prioritizes_next_appointment',
       (tester) async {
     tester.view.physicalSize = const Size(1280, 900);
@@ -110,6 +158,54 @@ void main() {
     expect(find.byType(NavigationRail), findsNothing);
     expect(find.text('Próxima consulta'), findsOneWidget);
     expect(find.text('Agendar consulta'), findsWidgets);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('cancelamento é destrutivo e exige confirmação clara',
+      (tester) async {
+    tester.view.physicalSize = const Size(1280, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final api = FakePatientApi();
+    await tester.pumpWidget(UbsApp(home: PatientDashboard(api: api)));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Ver detalhes').first);
+    await tester.pumpAndSettle();
+    expect(find.text('Cancelar consulta'), findsOneWidget);
+    expect(find.bySemanticsLabel('Cancelar consulta, ação destrutiva'),
+        findsOneWidget);
+    final destructive = tester.widget<FilledButton>(
+        find.widgetWithText(FilledButton, 'Cancelar consulta'));
+    final context = tester.element(find.text('Cancelar consulta'));
+    final destructiveColor = Theme.of(context).colorScheme.error;
+    expect(destructive.style?.backgroundColor?.resolve(<WidgetState>{}),
+        destructiveColor);
+
+    await tester.tap(find.text('Cancelar consulta'));
+    await tester.pumpAndSettle();
+    expect(find.text('Manter consulta'), findsNothing);
+    expect(find.text('Voltar'), findsOneWidget);
+    expect(find.text('Confirmar cancelamento'), findsOneWidget);
+    expect(find.bySemanticsLabel('Confirmar cancelamento, ação destrutiva'),
+        findsOneWidget);
+    final confirmDestructive = tester.widget<FilledButton>(
+        find.widgetWithText(FilledButton, 'Confirmar cancelamento'));
+    expect(confirmDestructive.autofocus, isFalse);
+    expect(confirmDestructive.style?.backgroundColor?.resolve(<WidgetState>{}),
+        destructiveColor);
+    await tester.tap(find.text('Voltar'));
+    await tester.pumpAndSettle();
+    expect(api.cancellations, 0);
+
+    await tester.tap(find.text('Ver detalhes').first);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Cancelar consulta'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Confirmar cancelamento'));
+    await tester.pumpAndSettle();
+    expect(api.cancellations, 1);
     expect(tester.takeException(), isNull);
   });
 
@@ -166,6 +262,267 @@ void main() {
         find.widgetWithText(AppActionButton, 'Agendar consulta').first;
     expect(action, findsOneWidget);
     expect(tester.getSize(action).height, greaterThanOrEqualTo(48));
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('cabeçalho e rolagem do paciente permanecem íntegros em 320 A+',
+      (tester) async {
+    tester.view.physicalSize = const Size(320, 640);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    accessibility.setFontScale(1.3);
+    addTearDown(() => accessibility.setFontScale(1));
+    await tester
+        .pumpWidget(UbsApp(home: PatientDashboard(api: FakePatientApi())));
+    await tester.pump();
+
+    final logo = tester
+        .getRect(find.bySemanticsLabel('UBS Rápida, saúde perto de você'));
+    final greeting = tester.getRect(find.text('Olá, Victor!'));
+    final menu =
+        tester.getRect(find.byKey(const Key('wide-navigation-menu-button')));
+    expect(logo.left, greaterThanOrEqualTo(0));
+    expect(logo.right, lessThanOrEqualTo(320));
+    expect(greeting.left, greaterThanOrEqualTo(0));
+    expect(greeting.right, lessThanOrEqualTo(320));
+    expect(menu.overlaps(logo), isFalse);
+    expect(menu.overlaps(greeting), isFalse);
+
+    final scroll = tester.widget<SingleChildScrollView>(
+        find.byKey(const Key('patient-body-scroll-view')));
+    expect(scroll.scrollDirection, Axis.vertical);
+    expect((scroll.padding as EdgeInsets).right,
+        greaterThanOrEqualTo(AppSpacing.xs));
+    final scrollbar = tester
+        .widget<Scrollbar>(find.byKey(const Key('patient-body-scrollbar')));
+    expect(scrollbar.thumbVisibility, isFalse);
+    expect(scrollbar.interactive, isFalse);
+    expect(scrollbar.controller!.offset, 0);
+
+    await tester.tap(find.byKey(const Key('wide-navigation-menu-button')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Consultas').last);
+    await tester.pumpAndSettle();
+    expect(scrollbar.controller!.offset, 0);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('agendamento expõe campos, horário, vaga e confirmação',
+      (tester) async {
+    tester.view.physicalSize = const Size(900, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final api = FakePatientApi(
+        hasAppointment: false, availableHours: const [7, 8, 13, 17]);
+    await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+            body: BookingPanel(api: api, old: null, onChanged: () {}))));
+    await tester.pumpAndSettle();
+    final semantics = tester.ensureSemantics();
+
+    expect(find.text('Como prefere começar?'), findsOneWidget);
+    expect(
+        find.text(
+            'Escolha a área de atendimento e depois um profissional disponível.'),
+        findsOneWidget);
+    expect(find.byKey(const Key('booking-filter-mode')), findsOneWidget);
+    final formTheme =
+        Theme.of(tester.element(find.byKey(const Key('booking-specialty'))))
+            .inputDecorationTheme;
+    final guidance =
+        tester.widget<Text>(find.byKey(const Key('booking-filter-guidance')));
+    expect(formTheme.labelStyle?.fontSize, 16);
+    expect(formTheme.hintStyle?.fontSize, 16);
+    expect(formTheme.helperStyle?.fontSize, 14);
+    expect(guidance.style?.fontSize, 16);
+
+    expect(find.bySemanticsLabel(RegExp('Especialidade para agendamento')),
+        findsOneWidget);
+    await tester.tap(find.byType(DropdownButtonFormField<String>));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Clínica Geral').last);
+    await tester.pumpAndSettle();
+    expect(find.bySemanticsLabel(RegExp('Profissional para agendamento')),
+        findsOneWidget);
+    await tester.tap(find.byType(DropdownButtonFormField<int>));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Dra. Ana Souza').last);
+    await tester.pumpAndSettle();
+    final specialtyRect =
+        tester.getRect(find.byType(DropdownButtonFormField<String>));
+    final professionalRect =
+        tester.getRect(find.byType(DropdownButtonFormField<int>));
+    final dateRect =
+        tester.getRect(find.byType(DropdownButtonFormField<DateTime>));
+    expect(specialtyRect.top, lessThan(professionalRect.top));
+    expect(professionalRect.top, lessThan(dateRect.top));
+    expect(
+        find.bySemanticsLabel(RegExp('Data para agendamento')), findsOneWidget);
+    await tester.tap(find.byType(DropdownButtonFormField<DateTime>));
+    await tester.pumpAndSettle();
+    expect(find.text(showBookingDate(api.at)), findsOneWidget);
+    await tester.tap(find.text(showBookingDate(api.at)).last);
+    await tester.pumpAndSettle();
+    expect(find.bySemanticsLabel(RegExp(r'\d\d:\d\d, Disponível')),
+        findsNWidgets(4));
+    expect(find.text('4. Escolha um horário'), findsOneWidget);
+    expect(find.textContaining('4 horários disponíveis'), findsOneWidget);
+    expect(find.text('Manhã'), findsOneWidget);
+    expect(find.text('Tarde'), findsOneWidget);
+    expect(
+        find.byWidgetPredicate((widget) =>
+            widget is Semantics &&
+            widget.properties.label == 'Agendar consulta'),
+        findsOneWidget);
+
+    semantics.dispose();
+  });
+
+  testWidgets('agendamento explica especialidades inativas e ausência de vagas',
+      (tester) async {
+    await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+            body: BookingPanel(
+                api: FakePatientApi(emptySpecialties: true),
+                old: null,
+                onChanged: () {}))));
+    await tester.pumpAndSettle();
+    expect(
+        find.text('Nenhuma especialidade ativa disponível para agendamento.'),
+        findsOneWidget);
+
+    final api = FakePatientApi(emptyDates: true);
+    await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+            body: BookingPanel(
+                key: const ValueKey('empty-dates-booking'),
+                api: api,
+                old: null,
+                onChanged: () {}))));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byType(DropdownButtonFormField<String>));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Clínica Geral').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byType(DropdownButtonFormField<int>));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text(api.professionalName).last);
+    await tester.pumpAndSettle();
+    expect(
+        find.text(
+            'Não há vagas disponíveis para este profissional. Tente outro filtro.'),
+        findsOneWidget);
+    final emptyMessage = tester.widget<Text>(find.text(
+        'Não há vagas disponíveis para este profissional. Tente outro filtro.'));
+    expect(emptyMessage.style?.fontSize, 16);
+    expect(emptyMessage.style?.height, 1.45);
+    expect(find.byKey(const Key('next-available-date')), findsNothing);
+  });
+
+  testWidgets('agendamento mantém modo e ação visíveis em 320px com A+',
+      (tester) async {
+    tester.view.physicalSize = const Size(320, 560);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    accessibility.setFontScale(1.3);
+    addTearDown(() => accessibility.setFontScale(1));
+    await tester.pumpWidget(UbsApp(
+        home: Scaffold(
+            body: BookingPanel(
+                api: FakePatientApi(hasAppointment: false),
+                old: null,
+                onChanged: () {}))));
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const Key('booking-filter-mode')), findsOneWidget);
+    expect(find.text('Confirmar agendamento'), findsOneWidget);
+    await tester.tap(find.text('Profissional').first);
+    await tester.pumpAndSettle();
+    expect(
+        find.byKey(const Key('booking-professional-first'),
+            skipOffstage: false),
+        findsOneWidget);
+    expect(find.text('Confirmar agendamento'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('próxima data disponível carrega o primeiro dia com vaga',
+      (tester) async {
+    final api = FakePatientApi(hasAppointment: false);
+    await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+            body: BookingPanel(api: api, old: null, onChanged: () {}))));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byType(DropdownButtonFormField<String>));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Clínica Geral').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byType(DropdownButtonFormField<int>));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text(api.professionalName).last);
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const Key('next-available-date')), findsOneWidget);
+    expect(api.availableTimeCalls, 0);
+    await tester.tap(find.byKey(const Key('next-available-date')));
+    await tester.pumpAndSettle();
+    expect(api.availableTimeCalls, 1);
+    expect(
+        find.byType(AvailabilitySlotCard, skipOffstage: false), findsOneWidget);
+  });
+
+  testWidgets('resumo chega ao fim sem passar sob a ação fixa em A+',
+      (tester) async {
+    tester.view.physicalSize = const Size(900, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    accessibility.setFontScale(1.3);
+    addTearDown(() => accessibility.setFontScale(1));
+    final api = FakePatientApi(
+        hasAppointment: false,
+        specialtyName: 'Clínica geral',
+        professionalName:
+            'Dra. Ana Souza da Unidade Integrada de Saúde da Família');
+    await tester.pumpWidget(UbsApp(
+        home: Scaffold(
+            body: BookingPanel(api: api, old: null, onChanged: () {}))));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byType(DropdownButtonFormField<String>));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Clínica Geral').last);
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(find.byType(DropdownButtonFormField<int>));
+    await tester.tap(find.byType(DropdownButtonFormField<int>));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text(api.professionalName).last);
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(find.byType(DropdownButtonFormField<DateTime>));
+    await tester.tap(find.byType(DropdownButtonFormField<DateTime>));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text(showBookingDate(api.at)).last);
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(find.byType(AvailabilitySlotCard));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byType(AvailabilitySlotCard));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('booking-summary')), findsOneWidget);
+
+    final end = find.byKey(const Key('booking-summary-scroll-end'),
+        skipOffstage: false);
+    final action = find.text('Confirmar agendamento');
+    await tester.scrollUntilVisible(end, 200,
+        scrollable: find.byType(Scrollable).first);
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('booking-summary')), findsOneWidget);
+    expect(end, findsOneWidget);
+    expect(action, findsOneWidget);
+    expect(tester.getBottomLeft(end).dy,
+        lessThanOrEqualTo(tester.getTopLeft(action).dy));
     expect(tester.takeException(), isNull);
   });
 
@@ -256,16 +613,60 @@ void main() {
         home: PatientDashboard(api: FakePatientApi(hasAppointment: false))));
     await tester.pump();
     expect(find.text('Você não possui consultas agendadas.'), findsOneWidget);
+    expect(
+        find.byKey(const Key('wide-navigation-menu-button')), findsOneWidget);
+    await tester.tap(find.byKey(const Key('wide-navigation-menu-button')));
+    await tester.pumpAndSettle();
     expect(find.text('Consultas'), findsOneWidget);
     expect(find.text('Status'), findsOneWidget);
     expect(find.text('Perfil'), findsOneWidget);
+    await tester.tap(find.text('Início').last);
+    await tester.pumpAndSettle();
     final bookingAction =
         find.widgetWithText(AppActionButton, 'Agendar consulta').first;
     await tester.ensureVisible(bookingAction);
     await tester.pumpAndSettle();
     await tester.tap(bookingAction);
     await tester.pumpAndSettle();
-    expect(find.text('Especialidade'), findsOneWidget);
+    expect(find.text('Especialidade'), findsWidgets);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('agendamento mobile usa tela completa e protege a seleção',
+      (tester) async {
+    tester.view.physicalSize = const Size(360, 780);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final api = FakePatientApi(hasAppointment: false);
+    await tester.pumpWidget(MaterialApp(home: PatientDashboard(api: api)));
+    await tester.pump();
+
+    final action = find.text('Agendar consulta').first;
+    await tester.ensureVisible(action);
+    await tester.tap(action);
+    await tester.pumpAndSettle();
+    expect(find.byType(BookingPanel), findsOneWidget);
+    expect(find.byType(BottomSheet), findsNothing);
+
+    await tester.tap(find.byType(DropdownButtonFormField<String>));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Clínica Geral').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('Fechar'));
+    await tester.pumpAndSettle();
+    expect(find.text('Sair do agendamento?'), findsOneWidget);
+    expect(find.text('Continuar agendamento'), findsOneWidget);
+    expect(find.text('Descartar seleção'), findsOneWidget);
+
+    await tester.tap(find.text('Continuar agendamento'));
+    await tester.pumpAndSettle();
+    expect(find.byType(BookingPanel), findsOneWidget);
+    await tester.tap(find.byTooltip('Fechar'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Descartar seleção'));
+    await tester.pumpAndSettle();
+    expect(find.byType(BookingPanel), findsNothing);
     expect(tester.takeException(), isNull);
   });
 
@@ -282,7 +683,7 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.byType(DropdownButtonFormField<String>));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Clínica geral').last);
+    await tester.tap(find.text('Clínica Geral').last);
     await tester.pumpAndSettle();
     await tester.tap(find.byType(DropdownButtonFormField<int>));
     await tester.pumpAndSettle();
@@ -290,25 +691,76 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.byType(DropdownButtonFormField<DateTime>));
     await tester.pumpAndSettle();
-    await tester.tap(find.textContaining('/').last);
+    await tester.tap(find.text(showBookingDate(api.at)).last);
     await tester.pumpAndSettle();
     await tester.tap(find.byType(AvailabilitySlotCard).first);
     await tester.pumpAndSettle();
     expect(api.bookings, 0);
-    expect(find.text('Resumo'), findsOneWidget);
+    expect(find.text('Sua consulta'), findsOneWidget);
+    expect(find.text('Revise os dados antes de confirmar.'), findsOneWidget);
     final summary = find.byKey(const Key('booking-summary'));
     expect(find.descendant(of: summary, matching: find.text('Especialidade')),
         findsOneWidget);
     expect(find.descendant(of: summary, matching: find.text('Profissional')),
         findsOneWidget);
-    expect(find.descendant(of: summary, matching: find.text('Data')),
+    expect(find.byKey(const Key('booking-summary-date-time')), findsOneWidget);
+    expect(
+        find.text(showBookingSummaryDate(
+            DateTime(api.at.year, api.at.month, api.at.day, api.at.hour))),
         findsOneWidget);
-    expect(find.descendant(of: summary, matching: find.text('Horário')),
-        findsOneWidget);
+    expect(find.text('Alterar horário'), findsOneWidget);
+    expect(find.text('A reserva será concluída ao confirmar.'), findsOneWidget);
+    expect(find.byType(AvailabilityLegend), findsNothing,
+        reason: 'Os próprios cartões já comunicam o estado do horário.');
+    expect(find.text('Selecionado', skipOffstage: false), findsOneWidget);
     await tester.tap(find.text('Confirmar agendamento'));
     await tester.pumpAndSettle();
     expect(api.bookings, 1);
     expect(find.text('Dra. Ana Souza'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('agendamento permite começar por especialidade ou profissional',
+      (tester) async {
+    tester.view.physicalSize = const Size(900, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final api = FakePatientApi(hasAppointment: false);
+    await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+            body: BookingPanel(api: api, old: null, onChanged: () {}))));
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const Key('booking-filter-mode')), findsOneWidget);
+    expect(
+        find.text(
+            'Escolha a área de atendimento e depois um profissional disponível.'),
+        findsOneWidget);
+    expect(find.byKey(const Key('booking-professional-first')), findsNothing);
+    expect(find.byType(DropdownButtonFormField<int>), findsNothing);
+    expect(find.byType(DropdownButtonFormField<String>), findsOneWidget);
+
+    await tester.tap(find.text('Profissional').first);
+    await tester.pumpAndSettle();
+    expect(
+        find.text(
+            'Escolha quem fará o atendimento e depois uma especialidade disponível.'),
+        findsOneWidget);
+    expect(find.byKey(const Key('booking-professional-first')), findsOneWidget);
+    expect(find.byType(DropdownButtonFormField<String>), findsNothing);
+
+    await tester.tap(find.byKey(const Key('booking-professional-first')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text(api.professionalName).last);
+    await tester.pumpAndSettle();
+    expect(find.byType(DropdownButtonFormField<String>), findsOneWidget);
+    await tester.tap(find.byType(DropdownButtonFormField<String>));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text(specialtyDisplayName(api.specialtyName)).last);
+    await tester.pumpAndSettle();
+    expect(find.byType(DropdownButtonFormField<DateTime>), findsOneWidget);
+    expect(api.professionalSpecialtyCalls, 1);
     expect(tester.takeException(), isNull);
   });
 
@@ -325,7 +777,7 @@ void main() {
     await tester.pump();
     await tester.tap(find.byType(DropdownButtonFormField<String>));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Clínica geral').last);
+    await tester.tap(find.text('Clínica Geral').last);
     await tester.pumpAndSettle();
     await tester.tap(find.byType(DropdownButtonFormField<int>));
     await tester.pumpAndSettle();
@@ -333,7 +785,7 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.byType(DropdownButtonFormField<DateTime>));
     await tester.pumpAndSettle();
-    await tester.tap(find.textContaining('/').last);
+    await tester.tap(find.text(showBookingDate(api.at)).last);
     await tester.pumpAndSettle();
     await tester.tap(find.byType(AvailabilitySlotCard).first);
     await tester.pump();

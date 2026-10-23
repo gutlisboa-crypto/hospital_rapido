@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ubs_saude/main.dart';
@@ -56,6 +58,21 @@ class FakeMedicalApi extends ApiService {
   }
 }
 
+class PendingMedicalApi extends FakeMedicalApi {
+  PendingMedicalApi() {
+    item = medicalAppointment('em_atendimento');
+  }
+
+  final completion = Completer<MedicalAppointment>();
+
+  @override
+  Future<MedicalAppointment> completeMedicalCare(int id, String summary) {
+    completions++;
+    submittedSummary = summary;
+    return completion.future;
+  }
+}
+
 void main() {
   setUp(() {
     ApiService.session =
@@ -82,6 +99,19 @@ void main() {
     expect(find.text('Paciente Triado'), findsOneWidget);
     expect(find.text('Risco: Alto'), findsOneWidget);
     expect(find.text('Prioridade: Sem prioridade legal'), findsOneWidget);
+    final semantics = tester.ensureSemantics();
+    expect(
+        find.bySemanticsLabel(
+            RegExp('Paciente Paciente Triado.*Classificação de risco: alto')),
+        findsOneWidget);
+    expect(
+        find.bySemanticsLabel('Classificação de risco: alto'), findsOneWidget);
+    expect(
+        find.byWidgetPredicate((widget) =>
+            widget is Semantics &&
+            widget.properties.label == 'Iniciar atendimento'),
+        findsWidgets);
+    semantics.dispose();
     expect(tester.takeException(), isNull);
 
     await tester.pumpWidget(const SizedBox.shrink());
@@ -108,13 +138,46 @@ void main() {
     expect(find.text('Informe o resumo do atendimento.'), findsOneWidget);
     expect(api.completions, 0);
 
+    await tester.enterText(
+        find.byKey(const Key('medical-care-summary')), '   ');
+    await tester.pump();
+    expect(find.text('Informe o resumo do atendimento.'), findsOneWidget);
+    expect(api.completions, 0);
+
     await tester.enterText(find.byKey(const Key('medical-care-summary')),
         'Resumo fictício do atendimento.');
+    await tester.pump();
+    expect(find.text('Informe o resumo do atendimento.'), findsNothing);
     await tester.tap(find.text('Concluir atendimento'));
     await tester.pumpAndSettle();
     expect(api.completions, 1);
     expect(api.submittedSummary, 'Resumo fictício do atendimento.');
 
     await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('care_blocks_duplicate_completion_and_preserves_rejected_text',
+      (tester) async {
+    await tester.binding.setSurfaceSize(const Size(768, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final api = PendingMedicalApi();
+    await tester.pumpWidget(UbsApp(home: MedicalDashboard(api: api)));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Continuar atendimento'));
+    await tester.pumpAndSettle();
+    final summary = find.byKey(const Key('medical-care-summary'));
+    await tester.enterText(summary, 'Conteúdo que deve permanecer.');
+
+    final complete = find.text('Concluir atendimento');
+    await tester.tap(complete);
+    await tester.tap(complete, warnIfMissed: false);
+    expect(api.completions, 1);
+
+    api.completion.completeError(const ApiException('Recusa simulada.'));
+    await tester.pumpAndSettle();
+    expect(find.text('Recusa simulada.'), findsOneWidget);
+    expect(tester.widget<TextFormField>(summary).controller?.text,
+        'Conteúdo que deve permanecer.');
   });
 }

@@ -18,10 +18,10 @@
 - **Validações:** opções vêm da API; horário precisa permanecer disponível no momento da confirmação.
 - **Anterior/próxima:** dashboard -> painel de agendamento -> dashboard atualizado.
 - **Frontend:** `frontend/lib/screens/booking.dart` (`BookingPanel`).
-- **API:** `GET /specialties`, `/professionals`, `/availability/dates`, `/availability/times`; `POST /appointments`; `PUT /appointments/{id}/reschedule`.
+- **API:** `GET /specialties`, `/professionals`, `/availability/calendar-dates`, `/availability/calendar-times`; `POST /appointments` e `/appointments/{id}/reschedule`.
 
 ## Detalhes da consulta
 
 - **Finalidade:** mostrar profissional, especialidade, data, status e linha do tempo.
 - **Ações:** fechar, cancelar ou reagendar quando as regras de prazo e status permitem.
-- **API:** `GET /appointments/{id}`, `PUT /appointments/{id}/cancel` e `/reschedule`.
+- **API:** `GET /appointments/{id}`, `POST /appointments/{id}/cancel` e `/reschedule`.

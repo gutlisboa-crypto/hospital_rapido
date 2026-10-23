@@ -59,6 +59,14 @@ void main() {
     await tester.pumpWidget(UbsApp(home: AdminDashboard(api: api)));
     await tester.pumpAndSettle();
 
+    final navigation = find.byType(NavigationRail);
+    final navigationScroll = find
+        .descendant(of: navigation, matching: find.byType(Scrollable))
+        .first;
+    await tester.scrollUntilVisible(find.text('Médicos'), 180,
+        scrollable: navigationScroll);
+    await tester.ensureVisible(find.text('Médicos').first);
+    await tester.pumpAndSettle();
     await tester.tap(find.text('Médicos').first);
     await tester.pumpAndSettle();
     expect(find.text('Há Médico ativo para atendimento'), findsOneWidget);

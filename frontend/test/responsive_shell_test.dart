@@ -12,8 +12,10 @@ const destinations = [
 Future<void> pumpShell(WidgetTester tester, double width,
     {WideNavigationMode mode = WideNavigationMode.persistentRail,
     List<AppDestination> items = destinations,
+    double height = 800,
+    Widget body = const Text('Conteúdo principal', key: Key('shell-body')),
     ValueChanged<int>? onSelected}) async {
-  tester.view.physicalSize = Size(width, 800);
+  tester.view.physicalSize = Size(width, height);
   tester.view.devicePixelRatio = 1;
   await tester.pumpWidget(UbsApp(
     home: ResponsiveAppShell(
@@ -23,7 +25,7 @@ Future<void> pumpShell(WidgetTester tester, double width,
       selectedIndex: 0,
       onDestinationSelected: onSelected ?? (_) {},
       wideNavigationMode: mode,
-      body: const Text('Conteúdo principal', key: Key('shell-body')),
+      body: body,
     ),
   ));
   await tester.pump();
@@ -48,6 +50,96 @@ void main() {
     expect(find.byType(NavigationBar), findsNothing);
   });
 
+  testWidgets('wide navigation keeps readable labels at A+', (tester) async {
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    accessibility.setFontScale(1.3);
+    await pumpShell(tester, 1280, items: const [
+      AppDestination(
+          icon: Icons.manage_accounts_outlined, label: 'Usuários internos'),
+      AppDestination(
+          icon: Icons.medical_information_outlined, label: 'Especialidades'),
+    ]);
+
+    final navigationTheme =
+        tester.widget<NavigationRailTheme>(find.byType(NavigationRailTheme));
+    expect(navigationTheme.data.selectedLabelTextStyle?.fontSize,
+        greaterThanOrEqualTo(18));
+    expect(tester.getSize(find.byType(NavigationRailTheme)).width, 268);
+    expect(find.text('Usuários internos'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('authenticated shell uses the full height without waves',
+      (tester) async {
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    accessibility.setFontScale(1.3);
+    await pumpShell(
+      tester,
+      1280,
+      height: 600,
+      mode: WideNavigationMode.contentOnly,
+      body: const SizedBox.expand(key: Key('shell-body')),
+    );
+
+    expect(find.byType(WaveBackground), findsNothing);
+    expect(
+        tester
+            .getBottomRight(find.byKey(const Key('app-page-content-safe-area')))
+            .dy,
+        greaterThanOrEqualTo(576));
+    expect(tester.getBottomRight(find.byKey(const Key('shell-body'))).dy,
+        greaterThanOrEqualTo(576));
+    expect(tester.takeException(), isNull);
+
+    accessibility.setContrast(true);
+    await pumpShell(
+      tester,
+      320,
+      height: 600,
+      mode: WideNavigationMode.contentOnly,
+      body: const SizedBox.expand(key: Key('shell-body')),
+    );
+    expect(find.byType(WaveBackground), findsNothing);
+    expect(
+        tester
+            .getBottomRight(find.byKey(const Key('app-page-content-safe-area')))
+            .dy,
+        greaterThanOrEqualTo(576));
+    expect(tester.getBottomRight(find.byKey(const Key('shell-body'))).dy,
+        greaterThanOrEqualTo(520));
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('compact admin menu keeps full labels at A+', (tester) async {
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    accessibility.setFontScale(1.3);
+    const longLabel = 'Histórico e auditoria administrativa';
+    await pumpShell(tester, 320, items: const [
+      AppDestination(icon: Icons.home_outlined, label: 'Visão geral'),
+      AppDestination(icon: Icons.event_outlined, label: 'Agenda'),
+      AppDestination(icon: Icons.people_outlined, label: 'Usuários internos'),
+      AppDestination(icon: Icons.badge_outlined, label: 'Profissionais'),
+      AppDestination(icon: Icons.medical_services_outlined, label: 'Médicos'),
+      AppDestination(icon: Icons.history_outlined, label: longLabel),
+    ]);
+
+    final picker =
+        find.byKey(const Key('responsive-compact-destination-picker'));
+    expect(picker, findsOneWidget);
+    await tester.tap(picker);
+    await tester.pumpAndSettle();
+
+    final label = tester.widget<Text>(find.text(longLabel).last);
+    expect(label.maxLines, 2);
+    expect(label.overflow, isNull);
+    expect(find.byTooltip(longLabel), findsWidgets);
+    expect(find.bySemanticsLabel('Seção $longLabel'), findsWidgets);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('overlay_menu_starts_closed_and_closes_after_selection',
       (tester) async {
     addTearDown(tester.view.resetPhysicalSize);
@@ -58,7 +150,8 @@ void main() {
         onSelected: (value) => selected = value);
 
     expect(find.byType(NavigationRail), findsNothing);
-    expect(find.byKey(const Key('wide-navigation-menu-button')), findsOneWidget);
+    expect(
+        find.byKey(const Key('wide-navigation-menu-button')), findsOneWidget);
     expect(find.byKey(const Key('wide-navigation-panel')), findsNothing);
 
     await tester.tap(find.byKey(const Key('wide-navigation-menu-button')));

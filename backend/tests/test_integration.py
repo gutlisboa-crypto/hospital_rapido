@@ -21,6 +21,7 @@ from app.models import (
     Appointment,
     ProfessionalSchedule,
     ProfessionalProfile,
+    RiskClassification,
     AuditLog,
     ScheduleGrid,
     Specialty,
@@ -47,6 +48,7 @@ def data(**overrides):
         email="maria@example.com",
         phone="11999998888",
         password="Paciente@123",
+        password_confirmation="Paciente@123",
         **overrides,
     )
 
@@ -149,78 +151,60 @@ def test_minors_share_guardian(client):
         assert db.scalar(select(func.count(PatientGuardian.paciente_id))) == 2
 
 
-def recovery(client, monkeypatch):
-    import app.routes.recovery as module
-
-    sent = []
-    monkeypatch.setattr(
-        module,
-        "send_recovery",
-        lambda email, code: sent.append(code) if email else None,
-    )
-    assert register(client).status_code == 201
-    r = client.post("/auth/forgot-password", json={"document": "52998224725"})
-    assert r.status_code == 200 and len(sent) == 1
-    unknown = client.post("/auth/forgot-password", json={"document": "12345678909"})
-    assert unknown.json() == r.json()
-    with SessionLocal() as db:
-        row = db.scalar(select(PasswordRecovery))
-        assert row.codigo_hash != sent[0] and len(row.codigo_hash) == 64
-    return sent[0]
+def test_legacy_recovery_routes_are_removed(client):
+    for path in (
+        "/auth/forgot-password",
+        "/auth/verify-recovery-code",
+        "/auth/recovery/verify",
+        "/auth/reset-password",
+        "/auth/recovery/reset",
+        "/profissional/fila",
+        "/profissional/agendamentos/{appointment_id}",
+        "/profissional/agendamentos/{appointment_id}/chamar",
+        "/profissional/agendamentos/{appointment_id}/iniciar-atendimento",
+        "/profissional/agendamentos/{appointment_id}/concluir-atendimento",
+    ):
+        assert client.post(path, json={}).status_code == 404
 
 
-def test_recovery_complete_single_use_and_token_isolation(client, monkeypatch):
-    code = recovery(client, monkeypatch)
-    old = header(client)
-    r = client.post(
-        "/auth/verify-recovery-code", json={"document": "52998224725", "code": code}
-    )
-    assert r.status_code == 200
-    token = r.json()["recovery_token"]
-    assert (
-        client.get("/auth/me", headers={"Authorization": "Bearer " + token}).status_code
-        == 401
-    )
-    body = {
-        "recovery_token": token,
-        "password": "NovaSenha@123",
-        "password_confirmation": "NovaSenha@123",
+def test_openapi_contains_only_official_routes(client):
+    paths = client.get("/openapi.json").json()["paths"]
+    removed = {
+        "/patients/register",
+        "/me",
+        "/available-slots",
+        "/appointments/available",
+        "/availability/dates",
+        "/availability/times",
+        "/appointments/{appointment_id}/status",
+        "/auth/forgot-password",
+        "/auth/verify-recovery-code",
+        "/auth/recovery/verify",
+        "/auth/reset-password",
+        "/auth/recovery/reset",
     }
-    assert client.post("/auth/reset-password", json=body).status_code == 200
-    assert client.post("/auth/reset-password", json=body).status_code == 401
-    assert login(client).status_code == 401
-    assert login(client, password="NovaSenha@123").status_code == 200
-    assert client.get("/auth/me", headers=old).status_code == 401
+    assert removed.isdisjoint(paths)
+    assert set(paths["/appointments"]) == {"post"}
+    assert set(paths["/appointments/{appointment_id}"]) == {"get"}
+    assert {
+        "/auth/esqueci-senha",
+        "/availability/calendar-dates",
+        "/availability/calendar-times",
+        "/enfermagem/agendamentos/{appointment_id}/classificacao-risco",
+        "/medico/fila",
+    } <= set(paths)
 
 
-def test_incorrect_expired_and_attempt_limit(client, monkeypatch):
-    code = recovery(client, monkeypatch)
-    wrong = "000000" if code != "000000" else "111111"
-    for _ in range(5):
-        assert (
-            client.post(
-                "/auth/verify-recovery-code",
-                json={"document": "52998224725", "code": wrong},
-            ).status_code
-            == 400
-        )
-    assert (
-        client.post(
-            "/auth/verify-recovery-code", json={"document": "52998224725", "code": code}
-        ).status_code
-        == 400
-    )
-    with SessionLocal() as db:
-        row = db.scalar(select(PasswordRecovery))
-        row.tentativas = 0
-        row.expira_em = datetime.utcnow() - timedelta(seconds=1)
-        db.commit()
-    assert (
-        client.post(
-            "/auth/verify-recovery-code", json={"document": "52998224725", "code": code}
-        ).status_code
-        == 400
-    )
+def test_removed_appointment_availability_slug_returns_404(client):
+    assert client.get("/appointments/available").status_code == 404
+    assert register(client).status_code == 201
+    headers = header(client)
+    assert client.get("/appointments/available", headers=headers).status_code == 404
+    assert client.get("/appointments/not-an-id", headers=headers).status_code == 404
+
+    official_missing = client.get("/appointments/999999", headers=headers)
+    assert official_missing.status_code == 404
+    assert official_missing.json()["detail"] == "Consulta não encontrada"
 
 
 def test_login_throttling(client):
@@ -261,22 +245,9 @@ def test_appointments_permissions_and_cancellation(client):
     assert r.status_code == 201
     appointment_id = r.json()["id"]
     assert client.post("/appointments", json=body, headers=h).status_code == 409
-    assert (
-        client.put(
-            f"/appointments/{appointment_id}/status",
-            json={"status": "em_espera"},
-            headers=h,
-        ).status_code
-        == 403
-    )
-    assert (
-        client.put(f"/appointments/{appointment_id}/cancel", headers=h).status_code
-        == 200
-    )
-    assert (
-        client.put(f"/appointments/{appointment_id}/cancel", headers=h).status_code
-        == 409
-    )
+    assert client.put(f"/appointments/{appointment_id}/status", headers=h).status_code == 404
+    assert client.post(f"/appointments/{appointment_id}/cancel", headers=h).status_code == 200
+    assert client.post(f"/appointments/{appointment_id}/cancel", headers=h).status_code == 409
 
 
 def test_cors(client):
@@ -337,98 +308,6 @@ def test_smtp_uses_tls_and_app_password(monkeypatch):
     assert "123456" in calls[3][1].get_content()
 
 
-def test_presential_flow_and_queue(client):
-    register(client)
-    with SessionLocal() as db:
-        patient = db.scalar(select(User))
-        roles = {}
-        for index, role in enumerate(["recepcao", "enfermagem", "medico", "admin"]):
-            u = User(
-                nome="Equipe Teste",
-                cpf=str(10000000000 + index),
-                email=f"{role}@example.com",
-                senha_hash=pwd.hash("Equipe@123"),
-                perfil=role,
-            )
-            db.add(u)
-            db.flush()
-            roles[role] = u
-        item = Appointment(
-            paciente_id=patient.id,
-            medico_id=roles["medico"].id,
-            especialidade="Clínica geral",
-            data_horario=datetime.now(),
-            status="agendado",
-        )
-        db.add(item)
-        db.commit()
-        appointment_id = item.id
-        headers = {
-            role: {"Authorization": "Bearer " + make_token(u)}
-            for role, u in roles.items()
-        }
-    path = f"/appointments/{appointment_id}/status"
-    assert (
-        client.put(
-            path, headers=headers["medico"], json={"status": "em_atendimento"}
-        ).status_code
-        == 403
-    )
-    assert (
-        client.put(
-            path, headers=headers["recepcao"], json={"status": "em_espera"}
-        ).status_code
-        == 200
-    )
-    assert (
-        client.put(
-            path,
-            headers=headers["recepcao"],
-            json={
-                "status": "em_triagem",
-                "risk": "verde",
-                "triage": "Avaliação presencial",
-            },
-        ).status_code
-        == 403
-    )
-    assert (
-        client.put(
-            path,
-            headers=headers["enfermagem"],
-            json={
-                "status": "em_triagem",
-                "risk": "verde",
-                "triage": "Avaliação presencial",
-            },
-        ).status_code
-        == 200
-    )
-    assert (
-        client.get("/queue", headers=headers["medico"]).json()[0]["id"]
-        == appointment_id
-    )
-    assert (
-        client.put(
-            path, headers=headers["medico"], json={"status": "em_atendimento"}
-        ).status_code
-        == 403
-    )
-    assert (
-        client.put(
-            path, headers=headers["medico"], json={"status": "concluido"}
-        ).status_code
-        == 403
-    )
-    assert (
-        client.put(
-            f"/appointments/{appointment_id}/cancel", headers=header(client)
-        ).status_code
-        == 409
-    )
-    assert client.get("/queue", headers=headers["medico"]).json()[0]["id"] == appointment_id
-
-
 def test_migrate_existing_database_without_loss(client, tmp_path):
     # Only fictional records are used to verify legacy migration.
     import subprocess, sys, sqlite3
@@ -440,7 +319,52 @@ def test_migrate_existing_database_without_loss(client, tmp_path):
         u.cpf_responsavel = "11144477735"
         u.email_responsavel = "ana@example.com"
         db.add(Guardian(nome="Ana Souza", cpf="11144477735"))
+        doctor = User(
+            nome="Médico Migração",
+            cpf="39053344705",
+            email="medico.migracao@example.com",
+            senha_hash=pwd.hash("Medico@123"),
+            perfil="medico",
+        )
+        db.add(doctor)
+        db.flush()
+        appointment = Appointment(
+            paciente_id=u.id,
+            medico_id=doctor.id,
+            especialidade="Clínica Geral",
+            data_horario=future_weekday(),
+            status="em_triagem",
+            classificacao_risco="alto",
+        )
+        db.add(appointment)
+        db.flush()
+        db.add(RiskClassification(
+            consulta_id=appointment.id,
+            profissional_id=doctor.id,
+            nivel_risco="alto",
+            queixa_principal="Queixa preservada.",
+            sinais_vitais="Sinais preservados.",
+        ))
+        official = Appointment(
+            paciente_id=u.id,
+            medico_id=doctor.id,
+            especialidade="Clínica Geral",
+            data_horario=future_weekday().replace(hour=10),
+            status="em_triagem",
+            classificacao_risco="muito_alto",
+        )
+        db.add(official)
+        db.flush()
+        db.add(RiskClassification(
+            consulta_id=official.id,
+            profissional_id=doctor.id,
+            nivel_risco="baixo",
+            queixa_principal="Queixa oficial preservada.",
+            sinais_vitais="Sinais oficiais preservados.",
+        ))
         db.commit()
+        appointment_id = appointment.id
+        official_id = official.id
     target = tmp_path / "old.db"
     with sqlite3.connect(engine.url.database) as source, sqlite3.connect(
         target
@@ -452,6 +376,14 @@ def test_migrate_existing_database_without_loss(client, tmp_path):
             "ALTER TABLE classificacoes_risco DROP COLUMN queixa_principal"
         )
         connection.execute("ALTER TABLE classificacoes_risco DROP COLUMN sinais_vitais")
+        connection.execute(
+            "UPDATE consultas SET classificacao_risco = 'verde' WHERE id = ?",
+            (appointment_id,),
+        )
+        connection.execute(
+            "UPDATE classificacoes_risco SET nivel_risco = 'medio' WHERE consulta_id = ?",
+            (appointment_id,),
+        )
         before = connection.execute("SELECT COUNT(*) FROM usuarios").fetchone()[0]
     env = dict(os.environ, DATABASE_URL="sqlite:///" + str(target))
     result = subprocess.run(
@@ -478,6 +410,20 @@ def test_migrate_existing_database_without_loss(client, tmp_path):
         ]
         assert "queixa_principal" in risk_columns
         assert "sinais_vitais" in risk_columns
+        assert connection.execute(
+            "SELECT classificacao_risco FROM consultas WHERE id = ?", (appointment_id,)
+        ).fetchone()[0] == "baixo"
+        assert connection.execute(
+            "SELECT nivel_risco FROM classificacoes_risco WHERE consulta_id = ?",
+            (appointment_id,),
+        ).fetchone()[0] == "moderado"
+        assert connection.execute(
+            "SELECT classificacao_risco FROM consultas WHERE id = ?", (official_id,)
+        ).fetchone()[0] == "muito_alto"
+        assert connection.execute(
+            "SELECT nivel_risco FROM classificacoes_risco WHERE consulta_id = ?",
+            (official_id,),
+        ).fetchone()[0] == "baixo"
 
 
 @pytest.mark.parametrize("cns", [None, ""])
@@ -524,48 +470,8 @@ def test_login_rejects_cns_and_invalid_cpf(client, document):
     assert login(client, document=document).status_code == 401
 
 
-def test_recovery_rejects_cns_even_with_correct_code(client, monkeypatch):
-    import app.routes.recovery as module
-
-    sent = []
-    monkeypatch.setattr(
-        module,
-        "send_recovery",
-        lambda email, code: sent.append(code) if email else None,
-    )
-    assert register(client).status_code == 201
-    assert (
-        client.post(
-            "/auth/forgot-password", json={"document": "123456789012345"}
-        ).status_code
-        == 200
-    )
-    assert sent == []
-    assert (
-        client.post(
-            "/auth/forgot-password", json={"document": "529.982.247-25"}
-        ).status_code
-        == 200
-    )
-    assert len(sent) == 1
-    assert (
-        client.post(
-            "/auth/verify-recovery-code",
-            json={"document": "123456789012345", "code": sent[0]},
-        ).status_code
-        == 400
-    )
-    assert (
-        client.post(
-            "/auth/verify-recovery-code",
-            json={"document": "529.982.247-25", "code": sent[0]},
-        ).status_code
-        == 200
-    )
-
-
 def test_change_password(client, monkeypatch):
-    code = recovery(client, monkeypatch)
+    assert register(client).status_code == 201
     h = header(client)
     body = {"current_password": "Errada@123", "password": "NovaSenha@123"}
     assert client.post("/auth/change-password", json=body).status_code in (401, 403)
@@ -589,12 +495,6 @@ def test_change_password(client, monkeypatch):
     assert client.get("/auth/me", headers=h).status_code == 401
     assert login(client).status_code == 401
     assert login(client, password="NovaSenha@123").status_code == 200
-    assert (
-        client.post(
-            "/auth/verify-recovery-code", json={"document": "52998224725", "code": code}
-        ).status_code
-        == 400
-    )
 
 
 def test_patient_summary_availability_and_ownership(client):
@@ -624,9 +524,8 @@ def test_patient_summary_availability_and_ownership(client):
     assert any(x["id"] == doctor_id for x in client.get(
         "/professionals", params={"specialty": "Clínica geral"}, headers=first).json())
     params = {"specialty": "Clínica geral", "doctor_id": doctor_id}
-    assert client.get("/availability/dates", params=params, headers=first).json() == [at.date().isoformat()]
-    assert client.get("/appointments/available", params=params, headers=first).status_code == 200
-    times = client.get("/availability/times", params={**params, "day": at.date().isoformat()}, headers=first)
+    assert client.get("/availability/calendar-dates", params=params, headers=first).json() == [at.date().isoformat()]
+    times = client.get("/availability/calendar-times", params={**params, "day": at.date().isoformat()}, headers=first)
     assert len(times.json()) == 1
     body = {**params, "scheduled_at": at.isoformat()}
     booked = client.post("/appointments", json=body, headers=first)
@@ -639,8 +538,10 @@ def test_patient_summary_availability_and_ownership(client):
     assert client.post(f"/appointments/{appointment_id}/cancel", headers=second).status_code == 403
     assert client.post(f"/appointments/{appointment_id}/reschedule", headers=second,
         json={"doctor_id": doctor_id, "scheduled_at": at.isoformat()}).status_code == 403
-    assert client.get("/availability/times", params={**params, "day": at.date().isoformat()}, headers=second).json() == []
-    assert client.get("/patients/me", headers={}).status_code in (401, 403)
+    assert client.get("/availability/calendar-times", params={**params, "day": at.date().isoformat()}, headers=second).json()[0]["availability"] == "unavailable"
+    unauthenticated = client.get("/patients/me", headers={})
+    assert unauthenticated.status_code == 401
+    assert unauthenticated.headers["www-authenticate"] == "Bearer"
     assert client.get("/patients/me", headers={"Authorization": "Bearer invalid"}).status_code == 401
     assert client.get("/patients/me", headers=staff).status_code == 403
     assert client.get("/appointments/me", headers=staff).status_code == 403
@@ -672,7 +573,7 @@ def test_slot_conflict_reschedule_and_release(client):
         json={"doctor_id": doctor_id, "scheduled_at": times[1].isoformat()})
     assert moved.status_code == 200
     assert moved.json()["scheduled_at"] == times[1].isoformat()
-    assert client.get("/availability/dates", params={"specialty": "Clínica geral", "doctor_id": doctor_id}, headers=h).json() == [times[0].date().isoformat()]
+    assert client.get("/availability/calendar-dates", params={"specialty": "Clínica geral", "doctor_id": doctor_id}, headers=h).json() == [times[0].date().isoformat()]
     with SessionLocal() as db:
         assert db.get(Appointment, item_id).data_horario == times[1]
     cancelled = client.post(f"/appointments/{item_id}/cancel", headers=h)
@@ -681,9 +582,81 @@ def test_slot_conflict_reschedule_and_release(client):
     assert client.post("/appointments", json=body(times[1]), headers=h).status_code == 201
 
 
+def test_patient_can_filter_specialties_starting_with_professional(client):
+    register(client)
+    headers = header(client)
+    with SessionLocal() as db:
+        specialty = db.scalar(select(Specialty).where(
+            func.lower(Specialty.nome) == "clínica geral"))
+        other = Specialty(nome="Pediatria fictícia", ativo=True)
+        doctor = User(
+            nome="Médica Fictícia",
+            cpf="11144477735",
+            email="medica.filtro@example.com",
+            senha_hash=pwd.hash("Doctor@123"),
+            perfil="medico",
+            ativo=True,
+        )
+        db.add_all([other, doctor])
+        db.flush()
+        db.add(ProfessionalProfile(
+            usuario_id=doctor.id,
+            registro_profissional="CRM-FILTRO-1",
+            especialidade_id=specialty.id,
+            ativo=True,
+        ))
+        db.commit()
+        doctor_id, specialty_name = doctor.id, specialty.nome
+
+    response = client.get(
+        "/specialties",
+        params={"professional_id": doctor_id},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    assert [item["name"] for item in response.json()] == [specialty_name]
+
+
+def test_minor_appointment_requires_valid_guardian_link_even_with_legacy_flag(client):
+    register(client)
+    headers = header(client)
+    with SessionLocal() as db:
+        patient = db.scalar(select(User).where(User.perfil == "paciente"))
+        patient.data_nascimento = datetime.now().replace(year=datetime.now().year - 10)
+        patient.e_menor_idade = False
+        doctor = User(
+            nome="Médico Fictício",
+            cpf="11144477735",
+            email="medico.menor@example.com",
+            senha_hash=pwd.hash("Doctor@123"),
+            perfil="medico",
+        )
+        db.add(doctor)
+        db.flush()
+        at = future_weekday()
+        db.add(ProfessionalSchedule(
+            medico_id=doctor.id,
+            data_horario=at,
+            especialidade="Clínica geral",
+        ))
+        db.commit()
+        doctor_id = doctor.id
+
+    response = client.post(
+        "/appointments",
+        headers=headers,
+        json={
+            "doctor_id": doctor_id,
+            "specialty": "Clínica geral",
+            "scheduled_at": at.isoformat(),
+        },
+    )
+    assert response.status_code == 409
+    assert "responsável legal" in response.json()["detail"]
+
+
 def test_exact_time_boundaries(client, monkeypatch):
-    import importlib
-    module = importlib.import_module("app.main")
+    from app.core import clock
     register(client)
     h = header(client)
     anchor = (datetime.now() + timedelta(days=1)).replace(
@@ -714,11 +687,7 @@ def test_exact_time_boundaries(client, monkeypatch):
             especialidade="Clínica geral", data_horario=slots[7], status="agendado")
         db.add(too_soon); db.flush(); too_soon_id = too_soon.id
         db.commit(); doctor_id = doctor.id
-    class FrozenDateTime(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return anchor if tz is None else anchor.replace(tzinfo=tz)
-    monkeypatch.setattr(module, "datetime", FrozenDateTime)
+    monkeypatch.setattr(clock, "now_sao_paulo_naive", lambda: anchor)
     assert client.post(f"/appointments/{cancel_items[0]}/cancel", headers=h).status_code == 409
     assert client.post(f"/appointments/{cancel_items[1]}/cancel", headers=h).status_code == 200
     assert client.post(f"/appointments/{cancel_items[2]}/cancel", headers=h).status_code == 200
@@ -790,6 +759,130 @@ def test_appointment_survives_api_restart(client):
     with TestClient(app) as restarted:
         assert restarted.get("/appointments/me", headers=h).json()[0]["id"] == booked.json()["id"]
         assert restarted.get("/patients/me/summary", headers=h).json()["next_appointment"]["id"] == booked.json()["id"]
+
+
+def test_complete_official_patient_to_medical_flow(client):
+    register(client)
+    patient_headers = header(client)
+    with SessionLocal() as db:
+        specialty = db.scalar(select(Specialty).where(
+            func.lower(Specialty.nome) == "clínica geral"))
+        doctor = User(
+            nome="Médico do Fluxo",
+            cpf="11144477735",
+            email="medico.fluxo@example.com",
+            senha_hash=pwd.hash("Medico@123"),
+            perfil="medico",
+            ativo=True,
+        )
+        nurse = User(
+            nome="Enfermeira do Fluxo",
+            cpf="39053344705",
+            email="enfermeira.fluxo@example.com",
+            senha_hash=pwd.hash("Enfermagem@123"),
+            perfil="enfermagem",
+            ativo=True,
+        )
+        reception = User(
+            nome="Recepção do Fluxo",
+            cpf="12345678909",
+            email="recepcao.fluxo@example.com",
+            senha_hash=pwd.hash("Recepcao@123"),
+            perfil="recepcao",
+            ativo=True,
+        )
+        db.add_all([doctor, nurse, reception])
+        db.flush()
+        db.add_all([
+            ProfessionalProfile(
+                usuario_id=doctor.id,
+                registro_profissional="CRM-FLUXO-1",
+                especialidade_id=specialty.id,
+                ativo=True,
+            ),
+            ProfessionalProfile(
+                usuario_id=nurse.id,
+                registro_profissional="COREN-FLUXO-1",
+                especialidade_id=specialty.id,
+                autorizado_triagem=True,
+                ativo=True,
+            ),
+        ])
+        available_at = future_weekday()
+        db.add(ProfessionalSchedule(
+            medico_id=doctor.id,
+            especialidade=specialty.nome,
+            data_horario=available_at,
+        ))
+        db.commit()
+        doctor_id = doctor.id
+
+    booked = client.post(
+        "/appointments",
+        headers=patient_headers,
+        json={
+            "doctor_id": doctor_id,
+            "specialty": "Clínica geral",
+            "scheduled_at": available_at.isoformat(),
+        },
+    )
+    assert booked.status_code == 201
+    appointment_id = booked.json()["id"]
+    with SessionLocal() as db:
+        appointment = db.get(Appointment, appointment_id)
+        appointment.data_horario = datetime.now() + timedelta(hours=1)
+        db.commit()
+
+    reception_headers = {
+        "Authorization": "Bearer " + login(client, "12345678909", "Recepcao@123").json()["access_token"]
+    }
+    day_rows = client.get(
+        "/recepcao/agendamentos", headers=reception_headers
+    )
+    assert day_rows.status_code == 200
+    assert appointment_id in {row["id"] for row in day_rows.json()}
+    assert client.patch(
+        f"/recepcao/agendamentos/{appointment_id}/check-in",
+        headers=reception_headers,
+    ).json()["status"] == "em_espera"
+
+    nurse_headers = {
+        "Authorization": "Bearer " + login(client, "39053344705", "Enfermagem@123").json()["access_token"]
+    }
+    nursing_queue = client.get("/enfermagem/fila", headers=nurse_headers)
+    assert appointment_id in {row["id"] for row in nursing_queue.json()}
+    triaged = client.patch(
+        f"/enfermagem/agendamentos/{appointment_id}/classificacao-risco",
+        headers=nurse_headers,
+        json={
+            "level": "alto",
+            "complaint": "Queixa principal fictícia.",
+            "vital_signs": "Sinais vitais fictícios estáveis.",
+        },
+    )
+    assert triaged.status_code == 200
+    assert triaged.json()["status"] == "em_triagem"
+
+    doctor_headers = {
+        "Authorization": "Bearer " + login(client, "11144477735", "Medico@123").json()["access_token"]
+    }
+    medical_queue = client.get("/medico/fila", headers=doctor_headers)
+    assert [row["id"] for row in medical_queue.json()] == [appointment_id]
+    assert client.patch(
+        f"/medico/atendimentos/{appointment_id}/iniciar",
+        headers=doctor_headers,
+    ).json()["status"] == "em_atendimento"
+    completed = client.patch(
+        f"/medico/atendimentos/{appointment_id}/concluir",
+        headers=doctor_headers,
+        json={"summary": "Atendimento fictício concluído."},
+    )
+    assert completed.status_code == 200
+    assert completed.json()["status"] == "concluido"
+
+    patient_view = client.get("/appointments/me", headers=patient_headers)
+    assert patient_view.status_code == 200
+    assert patient_view.json()[0]["status"] == "concluido"
 
 
 def _admin_headers():
@@ -906,8 +999,7 @@ def test_checkin_duplicate_cancelled_and_grid_overlap(client):
         db.add_all([appointment, cancelled]); db.commit()
         appointment_id, cancelled_id, professional_id, specialty_id = appointment.id, cancelled.id, professional.id, specialty.id
     assert client.post(f"/admin/appointments/{appointment_id}/check-in", headers=headers).status_code == 200
-    assert client.put(f"/appointments/{appointment_id}/status", headers=headers,
-        json={"status": "em_triagem", "risk": "verde", "triage": "Dados fictícios"}).status_code == 403
+    assert client.put(f"/appointments/{appointment_id}/status", headers=headers).status_code == 404
     assert client.post(f"/admin/appointments/{appointment_id}/check-in", headers=headers).status_code == 409
     assert client.post(f"/admin/appointments/{cancelled_id}/check-in", headers=headers).status_code == 409
     searched = client.get("/admin/appointments", headers=headers, params={
@@ -932,6 +1024,67 @@ def test_checkin_duplicate_cancelled_and_grid_overlap(client):
             ProfessionalSchedule.medico_id == professional_id,
             ProfessionalSchedule.data_horario == at_break)) is None
         assert db.scalar(select(func.count(ScheduleGrid.id))) == 1
+
+
+def test_admin_manages_nursing_schedule_and_rejects_non_professional_blocks(client):
+    headers, _ = _admin_headers()
+    register(client)
+    with SessionLocal() as db:
+        specialty = db.scalar(select(Specialty).where(
+            func.lower(Specialty.nome) == "clínica geral"))
+        nurse = User(
+            nome="Enfermeira de Agenda",
+            cpf="39053344705",
+            email="enfermeira.agenda@example.com",
+            senha_hash=pwd.hash("Equipe@123"),
+            perfil="enfermagem",
+            ativo=True,
+        )
+        patient = db.scalar(select(User).where(User.perfil == "paciente"))
+        db.add(nurse)
+        db.flush()
+        db.add(ProfessionalProfile(
+            usuario_id=nurse.id,
+            registro_profissional="COREN-AGENDA-1",
+            especialidade_id=specialty.id,
+            autorizado_triagem=True,
+            ativo=True,
+        ))
+        db.commit()
+        nurse_id, patient_id, specialty_id = nurse.id, patient.id, specialty.id
+
+    professionals = client.get("/admin/schedule-professionals", headers=headers)
+    assert professionals.status_code == 200
+    assert nurse_id in {item["id"] for item in professionals.json()}
+
+    from app.routes.admin import is_holiday
+    selected_day = (datetime.now() + timedelta(days=1)).date()
+    while selected_day.weekday() >= 5 or is_holiday(selected_day):
+        selected_day += timedelta(days=1)
+    grid = {
+        "professional_id": nurse_id,
+        "specialty_id": specialty_id,
+        "day": selected_day.isoformat(),
+        "start_time": "08:00",
+        "end_time": "10:00",
+        "duration_minutes": 60,
+        "capacity": 1,
+    }
+    assert client.post("/admin/grids", headers=headers, json=grid).status_code == 201
+    assert client.get("/admin/schedule-professionals", headers=header(client)).status_code == 403
+
+    start = datetime.combine(selected_day, datetime.strptime("08:00", "%H:%M").time())
+    invalid_block = client.post(
+        "/admin/blocks",
+        headers=headers,
+        json={
+            "professional_id": patient_id,
+            "start": start.isoformat(),
+            "end": (start + timedelta(hours=1)).isoformat(),
+            "reason": "outro",
+        },
+    )
+    assert invalid_block.status_code == 422
 
 
 def test_absence_details_specialties_and_schedule_rules(client):
@@ -967,7 +1120,7 @@ def test_absence_details_specialties_and_schedule_rules(client):
         assert db.get(Appointment, manual_id).status == "agendado"
 
     assert client.post(f"/admin/appointments/{manual_id}/absence",
-                       headers=reception_headers).status_code == 200
+                       headers=reception_headers).status_code == 409
     assert client.get(f"/admin/appointments/{manual_id}",
                       headers=reception_headers).json()["patient_document"].startswith("***")
     assert client.get(f"/admin/appointments/{manual_id}", headers=header(client)).status_code == 403
@@ -975,7 +1128,7 @@ def test_absence_details_specialties_and_schedule_rules(client):
     assert client.post("/admin/specialties", headers=headers,
                        json={"name": "Dermatologia Fictícia"}).status_code == 201
     listed = client.get("/admin/specialties", headers=headers).json()
-    assert [item["name"] for item in listed] == ["Clínica geral", "Dermatologia Fictícia"]
+    assert [item["name"] for item in listed] == ["Clínica Geral", "Dermatologia Fictícia"]
 
     next_day = (datetime.now() + timedelta(days=1)).date()
     while next_day.weekday() >= 5:

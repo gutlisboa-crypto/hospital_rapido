@@ -10,13 +10,18 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.core import clock
+from app.core.risk import RISK_LEVELS
+from app.core.specialty import GENERAL_SPECIALTY, canonical_specialty_name, specialty_key
 from app.core.security import canonical_role, pwd, require_roles
 from app.models import (
     Appointment, AppointmentStatusHistory, AuditLog, ProfessionalProfile,
-    ProfessionalSchedule, ScheduleBlock, ScheduleGrid, Specialty, User,
+    ProfessionalSchedule, PriorityCondition, PriorityConditionHistory,
+    ScheduleBlock, ScheduleGrid, Specialty, User,
 )
 from app.schemas import (
     AccessReset,
+    CatalogItem,
     DoctorCreate,
     DoctorResponse,
     DoctorUpdate,
@@ -24,18 +29,21 @@ from app.schemas import (
     InternalUserResponse,
     InternalUserUpdate,
 )
-from app.services.appointments import mark_overdue_absences
+from app.services.appointments import (
+    legal_priority_code, legal_priority_label, mark_overdue_absences,
+    record_audit_event, register_manual_absence,
+)
 
 router = APIRouter(prefix="/admin", tags=["administração"])
 
+APPOINTMENT_STATUSES = {
+    "agendado", "em_espera", "em_triagem", "em_atendimento",
+    "concluido", "cancelado", "falta",
+}
+
 
 def audit(db: Session, actor: User, action: str, kind: str, record_id: int | None, details: dict | None = None):
-    safe = details or {}
-    for key in list(safe):
-        if any(word in key.casefold() for word in ("senha", "password", "hash", "token", "cpf")):
-            safe.pop(key)
-    db.add(AuditLog(usuario_id=actor.id, acao=action, tipo_registro=kind,
-                    registro_id=record_id, detalhes=json.dumps(safe, ensure_ascii=False) if safe else None))
+    record_audit_event(db, actor, action, kind, record_id, details)
 
 
 def mask_cpf(cpf: str) -> str:
@@ -51,16 +59,19 @@ def doctor_response(db: Session, user: User) -> DoctorResponse:
         name=user.nome,
         masked_cpf=mask_cpf(user.cpf),
         active=user.ativo,
-        specialty=profile.especialidade.nome if profile else "Clínica Geral",
+        specialty=(canonical_specialty_name(profile.especialidade.nome)
+                   if profile else GENERAL_SPECIALTY),
     )
 
 
 def general_specialty(db: Session) -> Specialty:
     specialty = db.scalar(
-        select(Specialty).where(func.lower(Specialty.nome) == "clínica geral")
+        select(Specialty).where(
+            func.lower(func.trim(Specialty.nome)) == GENERAL_SPECIALTY.lower()
+        )
     )
     if not specialty:
-        specialty = Specialty(nome="Clínica Geral", ativo=True)
+        specialty = Specialty(nome=GENERAL_SPECIALTY, ativo=True)
         db.add(specialty)
         db.flush()
     elif not specialty.ativo:
@@ -392,7 +403,7 @@ def reset_access(user_id: int, payload: AccessReset, actor: User = Depends(requi
 
 
 @router.get("/summary")
-def summary(day: date = Query(default_factory=date.today), actor: User = Depends(require_roles("admin")),
+def summary(day: date = Query(default_factory=clock.today_sao_paulo), actor: User = Depends(require_roles("admin")),
             db: Session = Depends(get_db)):
     mark_overdue_absences(db, actor)
     start, end = datetime.combine(day, time.min), datetime.combine(day + timedelta(days=1), time.min)
@@ -416,19 +427,46 @@ def summary(day: date = Query(default_factory=date.today), actor: User = Depends
             "absent": counts.get("falta", 0)}
 
 
+@router.get("/schedule-professionals", response_model=list[CatalogItem])
+def schedule_professionals(
+    actor: User = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    rows = db.scalars(
+        select(User).where(
+            User.ativo.is_(True),
+            User.perfil.in_(["medico", "profissional", "enfermagem"]),
+        ).order_by(User.nome)
+    )
+    return [{"id": row.id, "name": row.nome} for row in rows]
+
+
 @router.get("/appointments")
-def agenda(day: date = Query(default_factory=date.today), specialty: str | None = None,
-           professional_id: int | None = None, status: str | None = None, patient: str | None = None,
+def agenda(day: date = Query(default_factory=clock.today_sao_paulo), specialty: str | None = None,
+           professional_id: int | None = None, status: str | None = None,
+           risk: str | None = None, patient: str | None = None,
            actor: User = Depends(require_roles("admin", "recepcao", "profissional")), db: Session = Depends(get_db)):
     mark_overdue_absences(db, actor)
+    specialty = specialty.strip() if specialty else None
+    status = status.strip() if status else None
+    risk = risk.strip() if risk else None
+    patient = patient.strip() if patient else None
+    if status and status not in APPOINTMENT_STATUSES:
+        raise HTTPException(422, "Status de consulta inválido")
+    if risk and risk not in RISK_LEVELS:
+        raise HTTPException(422, "Classificação de risco inválida")
     start, end = datetime.combine(day, time.min), datetime.combine(day + timedelta(days=1), time.min)
     query = select(Appointment).where(Appointment.data_horario >= start, Appointment.data_horario < end)
     if canonical_role(actor.perfil) == "profissional": query = query.where(Appointment.medico_id == actor.id)
-    if specialty: query = query.where(Appointment.especialidade == specialty)
+    if specialty: query = query.where(
+        func.lower(func.trim(Appointment.especialidade))
+        == canonical_specialty_name(specialty).lower()
+    )
     if professional_id: query = query.where(Appointment.medico_id == professional_id)
     if status: query = query.where(Appointment.status == status)
+    if risk: query = query.where(Appointment.classificacao_risco == risk)
     if patient:
-        term = patient.strip().lower()
+        term = patient.lower()
         cpf = "".join(c for c in term if c.isdigit())
         if len(term) == 5 and term[2] == ":" and term.replace(":", "").isdigit():
             query = query.where(func.strftime("%H:%M", Appointment.data_horario) == term)
@@ -438,9 +476,9 @@ def agenda(day: date = Query(default_factory=date.today), specialty: str | None 
                 User.cpf.contains(cpf) if cpf else False,
             ))
     return [{"id": x.id, "scheduled_at": x.data_horario, "patient": x.paciente.nome,
-             "patient_document": mask_cpf(x.paciente.cpf), "specialty": x.especialidade,
+             "patient_document": mask_cpf(x.paciente.cpf), "specialty": canonical_specialty_name(x.especialidade),
              "professional": x.medico.nome, "professional_id": x.medico_id, "status": x.status,
-             "legal_priority": x.paciente.e_prioridade or "geral", "risk_classification": x.classificacao_risco,
+             "legal_priority": legal_priority_code(x.paciente), "risk_classification": x.classificacao_risco,
              "arrived_at": x.chegada_em} for x in db.scalars(query.order_by(Appointment.data_horario)).unique()]
 
 
@@ -450,8 +488,8 @@ def check_in(appointment_id: int, actor: User = Depends(require_roles("admin", "
     if not row: raise HTTPException(404, "Agendamento não encontrado")
     if row.status == "cancelado": raise HTTPException(409, "Consulta cancelada não pode receber check-in")
     if row.status != "agendado" or row.chegada_em: raise HTTPException(409, "A chegada já foi confirmada ou o status é incompatível")
-    if row.data_horario.date() != date.today(): raise HTTPException(409, "A chegada só pode ser confirmada no dia da consulta")
-    previous = row.status; row.status = "em_espera"; row.chegada_em = datetime.now(); row.chegada_por = actor.id
+    if row.data_horario.date() != clock.today_sao_paulo(): raise HTTPException(409, "A chegada só pode ser confirmada no dia da consulta")
+    previous = row.status; row.status = "em_espera"; row.chegada_em = clock.now_sao_paulo_naive(); row.chegada_por = actor.id
     db.add(AppointmentStatusHistory(consulta_id=row.id, status_anterior=previous,
                                     status_novo=row.status, alterado_por=actor.id))
     audit(db, actor, "chegada_confirmada", "consulta", row.id)
@@ -464,15 +502,7 @@ def register_absence(appointment_id: int, actor: User = Depends(require_roles("a
                      db: Session = Depends(get_db)):
     row = db.get(Appointment, appointment_id)
     if not row: raise HTTPException(404, "Agendamento não encontrado")
-    if row.status != "agendado": raise HTTPException(409, "Somente consulta agendada pode receber falta")
-    if row.data_horario.date() != date.today():
-        raise HTTPException(409, "A falta manual só pode ser registrada no dia da consulta")
-    row.status = "falta"
-    row.falta_em = datetime.now()
-    db.add(AppointmentStatusHistory(consulta_id=row.id, status_anterior="agendado",
-                                    status_novo="falta", alterado_por=actor.id))
-    audit(db, actor, "falta_registrada", "consulta", row.id)
-    db.commit()
+    register_manual_absence(db, row, actor)
     return {"id": row.id, "status": row.status}
 
 
@@ -485,9 +515,17 @@ def appointment_details(appointment_id: int,
     if canonical_role(actor.perfil) == "profissional" and row.medico_id != actor.id:
         raise HTTPException(403, "Acesso permitido apenas às consultas atribuídas")
     return {"id": row.id, "scheduled_at": row.data_horario, "patient": row.paciente.nome,
-            "patient_document": mask_cpf(row.paciente.cpf), "specialty": row.especialidade,
+            "patient_document": mask_cpf(row.paciente.cpf), "specialty": canonical_specialty_name(row.especialidade),
             "professional": row.medico.nome, "status": row.status,
-            "legal_priority": row.paciente.e_prioridade or "geral",
+            "legal_priority": legal_priority_code(row.paciente),
+            "priority_reason": legal_priority_label(row.paciente),
+            "priority_conditions": [{
+                "condition": item.condicao,
+                "status": item.status,
+                "validated_by": item.responsavel_validacao.nome if item.responsavel_validacao else None,
+                "validated_at": item.validada_em,
+            } for item in row.paciente.condicoes_prioritarias
+              if item.status != "retirada"],
             "risk_classification": row.classificacao_risco, "arrived_at": row.chegada_em}
 
 
@@ -500,7 +538,39 @@ def audit_history(limit: int = Query(100, ge=1, le=500), actor: User = Depends(r
         who = db.get(User, row.usuario_id)
         result.append({"id": row.id, "actor": who.nome if who else "Usuário removido", "action": row.acao,
                        "record_type": row.tipo_registro, "record_id": row.registro_id,
-                       "details": json.loads(row.detalhes) if row.detalhes else None, "created_at": row.criado_em})
+                       "details": json.loads(row.detalhes) if row.detalhes else None,
+                       "created_at": clock.utc_naive_to_sao_paulo_naive(row.criado_em)})
+    return result
+
+
+@router.get("/priority-validations")
+def priority_validations(
+    actor: User = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    rows = list(db.scalars(
+        select(PriorityCondition).order_by(PriorityCondition.informada_em.desc())
+    ).unique())
+    result = []
+    for item in rows:
+        history = list(db.scalars(select(PriorityConditionHistory).where(
+            PriorityConditionHistory.condicao_prioritaria_id == item.id
+        ).order_by(PriorityConditionHistory.criado_em)))
+        result.append({
+            "id": item.id,
+            "patient": item.paciente.nome,
+            "condition": item.condicao,
+            "status": item.status,
+            "reported_at": item.informada_em,
+            "validated_by": item.responsavel_validacao.nome if item.responsavel_validacao else None,
+            "validated_at": item.validada_em,
+            "history": [{
+                "previous_status": event.status_anterior,
+                "new_status": event.status_novo,
+                "actor": (db.get(User, event.alterado_por).nome if db.get(User, event.alterado_por) else "Usuário removido"),
+                "created_at": event.criado_em,
+            } for event in history],
+        })
     return result
 
 
@@ -509,7 +579,7 @@ class SpecialtyInput(BaseModel):
 
 
 def normalized_specialty_name(value: str) -> str:
-    name = " ".join(value.split())
+    name = canonical_specialty_name(value)
     if not name:
         raise HTTPException(
             422,
@@ -527,9 +597,9 @@ def normalized_specialty_name(value: str) -> str:
 
 
 def specialty_name_exists(db: Session, name: str, *, except_id: int | None = None) -> bool:
-    normalized = name.casefold()
+    normalized = specialty_key(name)
     return any(
-        " ".join(row.nome.split()).casefold() == normalized
+        specialty_key(row.nome) == normalized
         for row in db.scalars(select(Specialty))
         if row.id != except_id
     )
@@ -537,7 +607,7 @@ def specialty_name_exists(db: Session, name: str, *, except_id: int | None = Non
 
 @router.get("/specialties")
 def list_specialties(actor: User = Depends(require_roles("admin")), db: Session = Depends(get_db)):
-    return [{"id": row.id, "name": row.nome, "active": row.ativo}
+    return [{"id": row.id, "name": canonical_specialty_name(row.nome), "active": row.ativo}
             for row in db.scalars(select(Specialty).order_by(Specialty.nome))]
 
 
@@ -583,7 +653,7 @@ def create_specialty(payload: SpecialtyInput, actor: User = Depends(require_role
     except IntegrityError:
         db.rollback()
         raise HTTPException(409, "Especialidade já cadastrada")
-    return {"id": row.id, "name": row.nome, "active": row.ativo}
+    return {"id": row.id, "name": canonical_specialty_name(row.nome), "active": row.ativo}
 
 
 @router.put("/specialties/{specialty_id}")
@@ -599,10 +669,10 @@ def update_specialty(specialty_id: int, payload: SpecialtyInput,
     # Grades e perfis mantêm o vínculo pelo id. Horários e consultas armazenam
     # o nome para preservar o histórico, portanto precisam acompanhar a edição.
     for schedule in db.scalars(select(ProfessionalSchedule).where(
-            func.lower(ProfessionalSchedule.especialidade) == old.lower())):
+            func.lower(func.trim(ProfessionalSchedule.especialidade)) == old.strip().lower())):
         schedule.especialidade = name
     for appointment in db.scalars(select(Appointment).where(
-            func.lower(Appointment.especialidade) == old.lower())):
+            func.lower(func.trim(Appointment.especialidade)) == old.strip().lower())):
         appointment.especialidade = name
     audit(db, actor, "especialidade_alterada", "especialidade", row.id,
           {"nome_anterior": old, "nome_novo": name})
@@ -611,7 +681,7 @@ def update_specialty(specialty_id: int, payload: SpecialtyInput,
     except IntegrityError:
         db.rollback()
         raise HTTPException(409, "Especialidade já cadastrada")
-    return {"id": row.id, "name": row.nome, "active": row.ativo}
+    return {"id": row.id, "name": canonical_specialty_name(row.nome), "active": row.ativo}
 
 
 @router.post("/specialties/{specialty_id}/{action}")
@@ -623,7 +693,7 @@ def set_specialty_active(specialty_id: int, action: Literal["activate", "deactiv
     audit(db, actor, "especialidade_ativada" if row.ativo else "especialidade_desativada",
           "especialidade", row.id, {"ativo": row.ativo})
     db.commit()
-    return {"id": row.id, "name": row.nome, "active": row.ativo}
+    return {"id": row.id, "name": canonical_specialty_name(row.nome), "active": row.ativo}
 
 
 class GridInput(BaseModel):
@@ -639,7 +709,7 @@ class GridInput(BaseModel):
 
 
 def build_slots(payload: GridInput):
-    if payload.day < date.today(): raise HTTPException(422, "Não é permitido cadastrar grade em data passada")
+    if payload.day < clock.today_sao_paulo(): raise HTTPException(422, "Não é permitido cadastrar grade em data passada")
     if payload.day.weekday() >= 5: raise HTTPException(422, "Atendimento permitido somente de segunda a sexta")
     if is_holiday(payload.day): raise HTTPException(422, "Não é permitido cadastrar grade em feriado nacional")
     if payload.duration_minutes != 60: raise HTTPException(422, "Cada consulta deve durar exatamente 60 minutos")
@@ -687,7 +757,7 @@ def is_holiday(day: date) -> bool:
 @router.get("/grids")
 def list_grids(actor: User = Depends(require_roles("admin")), db: Session = Depends(get_db)):
     return [{"id": x.id, "professional_id": x.profissional_id, "professional": x.profissional.nome,
-             "specialty_id": x.especialidade_id, "specialty": x.especialidade.nome,
+             "specialty_id": x.especialidade_id, "specialty": canonical_specialty_name(x.especialidade.nome),
              "day": x.data.date(), "start_time": x.horario_inicio, "end_time": x.horario_fim,
              "duration_minutes": x.duracao_minutos, "capacity": x.quantidade_vagas,
              "break_start": x.intervalo_inicio, "break_end": x.intervalo_fim, "active": x.ativo}
@@ -698,9 +768,23 @@ def list_grids(actor: User = Depends(require_roles("admin")), db: Session = Depe
 def create_grid(payload: GridInput, actor: User = Depends(require_roles("admin")), db: Session = Depends(get_db)):
     start, end, slots = build_slots(payload)
     professional = db.get(User, payload.professional_id); specialty = db.get(Specialty, payload.specialty_id)
-    if not professional or not professional.ativo or canonical_role(professional.perfil) != "medico":
+    if (
+        not professional
+        or not professional.ativo
+        or (
+            canonical_role(professional.perfil) != "medico"
+            and professional.perfil != "enfermagem"
+        )
+    ):
         raise HTTPException(422, "Profissional inválido")
     if not specialty or not specialty.ativo: raise HTTPException(422, "Especialidade inválida")
+    profile = db.scalar(select(ProfessionalProfile).where(
+        ProfessionalProfile.usuario_id == professional.id,
+        ProfessionalProfile.especialidade_id == specialty.id,
+        ProfessionalProfile.ativo.is_(True),
+    ))
+    if not profile:
+        raise HTTPException(422, "Profissional não está vinculado à especialidade")
     overlap = db.scalar(select(ScheduleGrid.id).where(ScheduleGrid.profissional_id == professional.id,
         ScheduleGrid.ativo.is_(True), ScheduleGrid.data == datetime.combine(payload.day, time.min),
         ScheduleGrid.horario_inicio < payload.end_time.strftime("%H:%M"),
@@ -756,9 +840,18 @@ class BlockInput(BaseModel):
 
 @router.post("/blocks", status_code=201)
 def block_period(payload: BlockInput, actor: User = Depends(require_roles("admin")), db: Session = Depends(get_db)):
-    if payload.start.tzinfo or payload.end.tzinfo or payload.end <= payload.start or payload.start < datetime.now():
+    if payload.start.tzinfo or payload.end.tzinfo or payload.end <= payload.start or payload.start < clock.now_sao_paulo_naive():
         raise HTTPException(422, "Período de bloqueio inválido")
-    if not db.get(User, payload.professional_id): raise HTTPException(422, "Profissional inválido")
+    professional = db.get(User, payload.professional_id)
+    if (
+        not professional
+        or not professional.ativo
+        or (
+            canonical_role(professional.perfil) != "medico"
+            and professional.perfil != "enfermagem"
+        )
+    ):
+        raise HTTPException(422, "Profissional inválido")
     occupied = db.scalar(select(Appointment.id).where(Appointment.medico_id == payload.professional_id,
         Appointment.data_horario >= payload.start, Appointment.data_horario < payload.end,
         Appointment.status != "cancelado"))

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -28,11 +30,19 @@ class FakeAdminApi extends ApiService {
           String? specialty,
           int? professionalId,
           String? status,
+          String? risk,
           String? patient}) async =>
       [];
 
   @override
-  Future<List<Map<String, dynamic>>> queue() async => [];
+  Future<List<Map<String, dynamic>>> queue(
+          {DateTime? day,
+          String? specialty,
+          int? professionalId,
+          String? status,
+          String? risk,
+          String? patient}) async =>
+      [];
 
   @override
   Future<List<Map<String, dynamic>>> specialties() async => [];
@@ -45,6 +55,9 @@ class FakeAdminApi extends ApiService {
 
   @override
   Future<List<Map<String, dynamic>>> auditHistory() async => [];
+
+  @override
+  Future<List<Map<String, dynamic>>> priorityValidations() async => [];
 
   @override
   Future<List<Map<String, dynamic>>> grids() async => [];
@@ -69,6 +82,7 @@ class FakeAgendaApi extends FakeAdminApi {
           String? specialty,
           int? professionalId,
           String? status,
+          String? risk,
           String? patient}) async =>
       [agendaItem];
 
@@ -125,6 +139,133 @@ class FakeAdminContentApi extends FakeAdminApi {
           'created_at': '2026-10-07T14:30:00'
         }
       ];
+
+  @override
+  Future<List<Map<String, dynamic>>> priorityValidations() async => [
+        {
+          'patient': 'Paciente Fictícia',
+          'condition': 'pcd',
+          'status': 'confirmada',
+          'validated_by': 'Recepção Fictícia',
+          'validated_at': '2026-10-07T14:25:00',
+          'history': [
+            {'new_status': 'pendente'},
+            {'new_status': 'confirmada'}
+          ],
+        }
+      ];
+}
+
+class FakeAdminQueueApi extends FakeAdminApi {
+  @override
+  Future<List<Map<String, dynamic>>> queue(
+          {DateTime? day,
+          String? specialty,
+          int? professionalId,
+          String? status,
+          String? risk,
+          String? patient}) async =>
+      [
+        for (var index = 1; index <= 6; index++)
+          {
+            'position': index,
+            'patient': 'Paciente $index',
+            'specialty': index.isEven ? 'Clínica geral' : 'Pediatria',
+            'professional': 'Profissional $index',
+            'arrived_at':
+                '2026-10-20T${(8 + index).toString().padLeft(2, '0')}:10:00',
+            'legal_priority': index == 1 ? 'gestante' : 'geral',
+            'risk_classification': index == 1 ? 'alto' : 'moderado',
+            'status': index == 1 ? 'em_atendimento' : 'em_triagem',
+          }
+      ];
+}
+
+class FakeOperationalFiltersApi extends FakeAdminApi {
+  String? agendaSpecialty,
+      agendaStatus,
+      agendaRisk,
+      agendaPatient,
+      queueSpecialty,
+      queueStatus,
+      queueRisk,
+      queuePatient;
+  int? agendaProfessionalId, queueProfessionalId;
+  Completer<List<Map<String, dynamic>>>? nextQueueRequest;
+
+  final agendaItem = AdminAppointment.fromJson({
+    'id': 91,
+    'scheduled_at': '2026-10-21T09:00:00',
+    'patient': 'Maria Fictícia',
+    'patient_document': '***.***.***-25',
+    'specialty': 'Clínica geral',
+    'professional': 'Dra. Ana',
+    'professional_id': 7,
+    'status': 'em_triagem',
+    'legal_priority': 'geral',
+    'risk_classification': 'alto',
+  });
+
+  @override
+  Future<List<AdminAppointment>> adminAppointments(
+      {DateTime? day,
+      String? specialty,
+      int? professionalId,
+      String? status,
+      String? risk,
+      String? patient}) async {
+    agendaSpecialty = specialty;
+    agendaProfessionalId = professionalId;
+    agendaStatus = status;
+    agendaRisk = risk;
+    agendaPatient = patient;
+    return patient?.trim() == 'Ninguém' ? [] : [agendaItem];
+  }
+
+  @override
+  Future<List<Map<String, dynamic>>> queue(
+      {DateTime? day,
+      String? specialty,
+      int? professionalId,
+      String? status,
+      String? risk,
+      String? patient}) async {
+    queueSpecialty = specialty;
+    queueProfessionalId = professionalId;
+    queueStatus = status;
+    queueRisk = risk;
+    queuePatient = patient;
+    final pending = nextQueueRequest;
+    if (pending != null) {
+      nextQueueRequest = null;
+      return pending.future;
+    }
+    if (patient?.trim() == 'Ninguém') return [];
+    return [
+      {
+        'position': 1,
+        'id': 91,
+        'patient': 'Maria F.',
+        'specialty': 'Clínica geral',
+        'professional': 'Dra. Ana',
+        'professional_id': 7,
+        'arrived_at': '2026-10-21T08:50:00',
+        'legal_priority': 'geral',
+        'risk_classification': 'alto',
+        'status': 'em_triagem',
+      }
+    ];
+  }
+
+  @override
+  Future<List<Map<String, dynamic>>> adminSpecialties() async => [
+        {'id': 1, 'name': 'Clínica geral', 'active': true}
+      ];
+
+  @override
+  Future<List<Map<String, dynamic>>> allProfessionals() async => [
+        {'id': 7, 'name': 'Dra. Ana'}
+      ];
 }
 
 class FakeSpecialtyManagementApi extends FakeAdminApi {
@@ -167,6 +308,36 @@ class FakeSpecialtyManagementApi extends FakeAdminApi {
   }
 }
 
+Future<void> selectAdminDestination(
+    WidgetTester tester, String _, String destination) async {
+  final compactPicker =
+      find.byKey(const Key('responsive-compact-destination-picker'));
+  if (compactPicker.evaluate().isNotEmpty) {
+    await tester.tap(compactPicker);
+    await tester.pumpAndSettle();
+    final panel = find.byKey(const Key('wide-navigation-panel'));
+    final scrollable =
+        find.descendant(of: panel, matching: find.byType(Scrollable)).first;
+    await tester.scrollUntilVisible(find.text(destination), 180,
+        scrollable: scrollable);
+    await tester.ensureVisible(find.text(destination).last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text(destination).last);
+    await tester.pumpAndSettle();
+    return;
+  }
+
+  final navigation = find.byType(NavigationRail);
+  final scrollable =
+      find.descendant(of: navigation, matching: find.byType(Scrollable)).first;
+  await tester.scrollUntilVisible(find.text(destination), 180,
+      scrollable: scrollable);
+  await tester.ensureVisible(find.text(destination).last);
+  await tester.pumpAndSettle();
+  await tester.tap(find.text(destination).last);
+  await tester.pumpAndSettle();
+}
+
 void main() {
   setUp(() async {
     SharedPreferences.setMockInitialValues({});
@@ -190,7 +361,31 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.byType(ResponsiveAppShell), findsOneWidget);
     expect(find.byType(NavigationRail), findsOneWidget);
-    expect(find.text('Consultas agendadas'), findsOneWidget);
+    expect(find.byKey(const Key('grouped-wide-navigation')), findsNothing);
+    expect(find.text('Visão geral'), findsOneWidget);
+    expect(find.text('Agenda do dia'), findsOneWidget);
+    final navigation = find.byType(NavigationRail);
+    final navigationColors = tester
+        .widgetList<Icon>(
+            find.descendant(of: navigation, matching: find.byType(Icon)))
+        .map((icon) => icon.color)
+        .whereType<Color>()
+        .toSet();
+    expect(navigationColors, contains(const Color(0xFF0F6B3A)));
+    expect(navigationColors, contains(const Color(0xFF005A9C)));
+    expect(navigationColors, contains(const Color(0xFF6A3DA6)));
+    expect(navigationColors, contains(const Color(0xFF9A4A00)));
+    expect(
+        AdminSection.specialties.icon, isNot(AdminSection.professionals.icon));
+    final scrollable = find
+        .descendant(of: navigation, matching: find.byType(Scrollable))
+        .first;
+    await tester.scrollUntilVisible(find.text('Usuários internos'), 180,
+        scrollable: scrollable);
+    expect(find.text('Usuários internos'), findsOneWidget);
+    await tester.scrollUntilVisible(find.text('Configurações'), 180,
+        scrollable: scrollable);
+    expect(find.text('Configurações'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
@@ -217,6 +412,199 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('fila associa status ao paciente e mantém último card acessível',
+      (tester) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final api = FakeAdminQueueApi();
+
+    await tester.binding.setSurfaceSize(const Size(1280, 760));
+    await tester.pumpWidget(UbsApp(
+        home: AdminDashboard(key: const ValueKey('compact-queue'), api: api)));
+    await tester.pumpAndSettle();
+    await selectAdminDestination(tester, 'Atendimento', 'Fila de atendimento');
+    final wideCard = find.byKey(const Key('admin-queue-card-1'));
+    final wideStatus = find.byKey(const Key('admin-queue-status-1'));
+    expect(wideCard, findsOneWidget);
+    expect(wideStatus, findsOneWidget);
+    expect(tester.getTopLeft(wideStatus).dx,
+        greaterThan(tester.getTopLeft(find.text('Paciente 1')).dx));
+    expect(tester.widget<Text>(find.text('Paciente 1')).style?.fontSize, 18);
+
+    accessibility.setFontScale(1.3);
+    await tester.binding.setSurfaceSize(const Size(360, 760));
+    await tester.pumpWidget(UbsApp(
+        home: AdminDashboard(
+            key: const ValueKey('compact-queue-a-plus'), api: api)));
+    await tester.pumpAndSettle();
+    await selectAdminDestination(tester, 'Atendimento', 'Fila de atendimento');
+    final queueList = find
+        .descendant(
+            of: find.byType(ListView).last, matching: find.byType(Scrollable))
+        .first;
+    await tester.scrollUntilVisible(
+        find.byKey(const Key('admin-queue-card-1'), skipOffstage: false), 120,
+        scrollable: queueList);
+    await tester.pumpAndSettle();
+    expect(tester.getTopLeft(find.byKey(const Key('admin-queue-status-1'))).dy,
+        greaterThan(tester.getTopLeft(find.text('Paciente 1')).dy));
+    await tester.scrollUntilVisible(
+        find.byKey(const Key('admin-queue-card-6')), 240,
+        scrollable: queueList);
+    expect(find.byKey(const Key('admin-queue-card-6')), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('agenda combina filtros no servidor e limpa todo o estado',
+      (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1280, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final api = FakeOperationalFiltersApi();
+    await tester.pumpWidget(UbsApp(home: AdminDashboard(api: api)));
+    await tester.pumpAndSettle();
+    await selectAdminDestination(tester, 'Agenda e oferta', 'Agenda do dia');
+
+    expect(find.byKey(const Key('admin-agenda-filter-region')), findsOneWidget);
+    expect(find.text('Limpar filtros'), findsOneWidget);
+
+    final searchRect =
+        tester.getRect(find.byKey(const Key('admin-agenda-search')));
+    final statusRect =
+        tester.getRect(find.byKey(const ValueKey('admin-agenda-status-null')));
+    final specialtyRect = tester
+        .getRect(find.byKey(const ValueKey('admin-agenda-specialty-null')));
+    final professionalRect = tester
+        .getRect(find.byKey(const ValueKey('admin-agenda-professional-null')));
+    final riskRect =
+        tester.getRect(find.byKey(const ValueKey('admin-agenda-risk-null')));
+    final dateRect = tester.getRect(find.byKey(const Key('admin-agenda-date')));
+    expect(statusRect.width, closeTo(searchRect.width, .01));
+    expect(specialtyRect.width, closeTo(searchRect.width, .01));
+    expect(riskRect.width, closeTo(professionalRect.width, .01));
+    expect(dateRect.width, closeTo(professionalRect.width, .01));
+    expect(professionalRect.left, searchRect.left);
+    expect(riskRect.left, statusRect.left);
+    expect(dateRect.left, specialtyRect.left);
+
+    await tester.ensureVisible(
+        find.byKey(const ValueKey('admin-agenda-specialty-null')));
+    await tester.tap(find.byKey(const ValueKey('admin-agenda-specialty-null')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Clínica Geral').last);
+    await tester.pumpAndSettle();
+
+    await tester
+        .tap(find.byKey(const ValueKey('admin-agenda-professional-null')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Dra. Ana').last);
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const ValueKey('admin-agenda-status-null')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Em triagem').last);
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const ValueKey('admin-agenda-risk-null')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('risk-filter-option-alto')).last);
+    await tester.pumpAndSettle();
+
+    await tester.enterText(
+        find.byKey(const Key('admin-agenda-search')), '  Maria  ');
+    await tester.testTextInput.receiveAction(TextInputAction.search);
+    await tester.pumpAndSettle();
+
+    expect(api.agendaSpecialty, 'Clínica geral');
+    expect(api.agendaProfessionalId, 7);
+    expect(api.agendaStatus, 'em_triagem');
+    expect(api.agendaRisk, 'alto');
+    expect(api.agendaPatient, '  Maria  ');
+
+    await tester
+        .ensureVisible(find.byKey(const Key('admin-agenda-clear-filters')));
+    await tester.tap(find.byKey(const Key('admin-agenda-clear-filters')));
+    await tester.pumpAndSettle();
+    expect(api.agendaSpecialty, isNull);
+    expect(api.agendaProfessionalId, isNull);
+    expect(api.agendaStatus, isNull);
+    expect(api.agendaRisk, isNull);
+    expect(api.agendaPatient, isEmpty);
+    final search =
+        tester.widget<TextField>(find.byKey(const Key('admin-agenda-search')));
+    expect(search.controller?.text, isEmpty);
+  });
+
+  testWidgets('fila mostra carregamento, vazio e restaura ao limpar filtros',
+      (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1280, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final api = FakeOperationalFiltersApi();
+    await tester.pumpWidget(UbsApp(home: AdminDashboard(api: api)));
+    await tester.pumpAndSettle();
+    await selectAdminDestination(tester, 'Atendimento', 'Fila de atendimento');
+
+    expect(find.byKey(const Key('admin-queue-filter-region')), findsOneWidget);
+    expect(find.text('Limpar filtros'), findsOneWidget);
+    final pending = Completer<List<Map<String, dynamic>>>();
+    api.nextQueueRequest = pending;
+    await tester.enterText(
+        find.byKey(const Key('admin-queue-search')), 'Ninguém');
+    await tester.tap(find.byTooltip('Buscar paciente'));
+    await tester.pump();
+    expect(find.byType(LinearProgressIndicator), findsOneWidget);
+
+    pending.complete([]);
+    await tester.pumpAndSettle();
+    expect(find.text('Nenhum paciente corresponde aos filtros selecionados.'),
+        findsOneWidget);
+    expect(api.queuePatient, 'Ninguém');
+
+    await tester
+        .ensureVisible(find.byKey(const Key('admin-queue-clear-filters')));
+    await tester.tap(find.byKey(const Key('admin-queue-clear-filters')));
+    await tester.pumpAndSettle();
+    expect(api.queuePatient, isEmpty);
+    expect(find.text('Maria F.'), findsOneWidget);
+  });
+
+  testWidgets('filtros operacionais suportam 320 e 360 pixels com A+',
+      (tester) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    accessibility.setFontScale(1.3);
+    accessibility.setContrast(true);
+    final semantics = tester.ensureSemantics();
+
+    for (final width in [320.0, 360.0]) {
+      await tester.binding.setSurfaceSize(const Size(1280, 800));
+      final api = FakeOperationalFiltersApi();
+      await tester.pumpWidget(UbsApp(
+          home: AdminDashboard(
+              key: ValueKey('operational-filters-$width'), api: api)));
+      await tester.pumpAndSettle();
+      await selectAdminDestination(tester, 'Agenda e oferta', 'Agenda do dia');
+      await tester.binding.setSurfaceSize(Size(width, 800));
+      await tester.pumpAndSettle();
+      final agendaList = find.descendant(
+          of: find.byKey(const Key('admin-module-content')),
+          matching: find.byType(ListView));
+      expect(agendaList, findsOneWidget);
+      await tester.drag(agendaList, const Offset(0, -600));
+      await tester.pumpAndSettle();
+      final filterRegion = find.byKey(const Key('admin-agenda-filter-region'));
+      expect(filterRegion, findsOneWidget, reason: 'largura $width');
+      expect(tester.getSemantics(filterRegion).label,
+          contains('Filtros de agendamentos administrativos'));
+      expect(find.bySemanticsLabel('Buscar paciente por nome ou CPF'),
+          findsOneWidget);
+      await tester.enterText(
+          find.byKey(const Key('admin-agenda-search')), 'Maria');
+      await tester.testTextInput.receiveAction(TextInputAction.search);
+      await tester.pumpAndSettle();
+      expect(api.agendaPatient, 'Maria');
+      expect(tester.takeException(), isNull);
+    }
+    semantics.dispose();
+  });
+
   testWidgets('long_internal_user_and_specialty_wrap_without_hiding_actions',
       (tester) async {
     await tester.binding.setSurfaceSize(const Size(360, 780));
@@ -224,11 +612,8 @@ void main() {
     await tester
         .pumpWidget(UbsApp(home: AdminDashboard(api: FakeAdminContentApi())));
     await tester.pumpAndSettle();
-    await tester
-        .tap(find.byKey(const Key('responsive-compact-destination-picker')));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Usuários internos').last);
-    await tester.pumpAndSettle();
+    await selectAdminDestination(
+        tester, 'Pessoas e acessos', 'Usuários internos');
     await tester.scrollUntilVisible(
         find.text(FakeAdminContentApi.longName), 180,
         scrollable: find.byType(Scrollable).last);
@@ -243,11 +628,8 @@ void main() {
     await tester
         .pumpWidget(UbsApp(home: AdminDashboard(api: FakeAdminContentApi())));
     await tester.pumpAndSettle();
-    await tester
-        .tap(find.byKey(const Key('responsive-compact-destination-picker')));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Usuários internos').last);
-    await tester.pumpAndSettle();
+    await selectAdminDestination(
+        tester, 'Pessoas e acessos', 'Usuários internos');
     expect(tester.takeException(), isNull,
         reason: 'A lista de usuários deve caber antes de abrir o diálogo.');
     await tester.ensureVisible(find.text('Cadastrar usuário'));
@@ -255,6 +637,31 @@ void main() {
     await tester.tap(find.text('Cadastrar usuário'));
     await tester.pumpAndSettle();
     expect(find.byType(AlertDialog), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('nova grade inicia com periodo matinal valido sem intervalo',
+      (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1280, 850));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(UbsApp(home: AdminDashboard(api: FakeAdminApi())));
+    await tester.pumpAndSettle();
+
+    await selectAdminDestination(
+        tester, 'Agenda e oferta', 'Grades e horários');
+    await tester.tap(find.text('Nova grade'));
+    await tester.pumpAndSettle();
+
+    String valueFor(String label) => tester
+        .widget<TextFormField>(find.ancestor(
+            of: find.text(label), matching: find.byType(TextFormField)))
+        .controller!
+        .text;
+
+    expect(valueFor('Início'), '09:00');
+    expect(valueFor('Fim'), '11:00');
+    expect(valueFor('Início intervalo'), isEmpty);
+    expect(valueFor('Fim intervalo'), isEmpty);
     expect(tester.takeException(), isNull);
   });
 
@@ -267,8 +674,7 @@ void main() {
     await tester.pumpWidget(UbsApp(home: AdminDashboard(api: api)));
     await tester.pumpAndSettle();
 
-    await tester.tap(find.text('Especialidades').last);
-    await tester.pumpAndSettle();
+    await selectAdminDestination(tester, 'Agenda e oferta', 'Especialidades');
     expect(find.byKey(const Key('new-specialty-button')), findsOneWidget);
     expect(find.text('Editar'), findsOneWidget);
 
@@ -326,11 +732,7 @@ void main() {
     final api = FakeSpecialtyManagementApi();
     await tester.pumpWidget(UbsApp(home: AdminDashboard(api: api)));
     await tester.pumpAndSettle();
-    await tester
-        .tap(find.byKey(const Key('responsive-compact-destination-picker')));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Especialidades').last);
-    await tester.pumpAndSettle();
+    await selectAdminDestination(tester, 'Agenda e oferta', 'Especialidades');
     await tester.ensureVisible(find.byKey(const Key('new-specialty-button')));
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('new-specialty-button')));
@@ -350,13 +752,12 @@ void main() {
     await tester
         .pumpWidget(UbsApp(home: AdminDashboard(api: FakeAdminContentApi())));
     await tester.pumpAndSettle();
-    await tester
-        .tap(find.byKey(const Key('responsive-compact-destination-picker')));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Histórico').last);
-    await tester.pumpAndSettle();
+    await selectAdminDestination(tester, 'Governança', 'Histórico');
     expect(find.text('Registrado'), findsOneWidget);
     expect(find.text('usuario ativado'), findsOneWidget);
+    expect(find.text('Paciente Fictícia • pcd'), findsOneWidget);
+    expect(
+        find.textContaining('Responsável: Recepção Fictícia'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
@@ -367,8 +768,7 @@ void main() {
     await tester
         .pumpWidget(UbsApp(home: AdminDashboard(api: FakeAdminContentApi())));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Histórico').last);
-    await tester.pumpAndSettle();
+    await selectAdminDestination(tester, 'Governança', 'Histórico');
 
     final registered = tester.widget<Text>(find.text('Registrado'));
     final date = tester.widget<Text>(find.text('2026-10-07 14:30'));
@@ -380,11 +780,6 @@ void main() {
     await tester.binding.setSurfaceSize(const Size(360, 780));
     await tester
         .pumpWidget(UbsApp(home: AdminDashboard(api: FakeAdminContentApi())));
-    await tester.pumpAndSettle();
-    await tester
-        .tap(find.byKey(const Key('responsive-compact-destination-picker')));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Histórico').last);
     await tester.pumpAndSettle();
 
     expect(tester.takeException(), isNull);
@@ -404,9 +799,9 @@ void main() {
     addTearDown(() => tester.binding.setSurfaceSize(null));
     await tester.pumpWidget(UbsApp(home: AdminDashboard(api: FakeAdminApi())));
     await tester.pumpAndSettle();
-    expect(find.text('Painel Administrativo • Administrador'), findsOneWidget);
-    expect(find.text('Consultas agendadas'), findsOneWidget);
-    expect(find.text('Usuários internos'), findsOneWidget);
+    expect(find.text('Administração'), findsOneWidget);
+    expect(find.text('Consultas agendadas'), findsWidgets);
+    expect(find.byType(NavigationRail), findsOneWidget);
     expect(find.text('4'), findsOneWidget);
   });
 
@@ -458,7 +853,7 @@ void main() {
     expect(find.text('Detalhes da consulta'), findsOneWidget);
     await tester.tap(find.text('Fechar'));
     await tester.pumpAndSettle();
-    expect(find.text('Painel Administrativo • Administrador'), findsOneWidget);
+    expect(find.text('Administração'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 }

@@ -140,8 +140,8 @@ void main() {
         return bytes!.buffer.asUint8List().sublist(0, 3);
       });
       expect(pixels, [0, 0, 0]);
-      await tester.ensureVisible(find.text('Esqueci minha senha'));
-      await tester.tap(find.text('Esqueci minha senha'));
+      await tester.ensureVisible(find.text('Esqueceu a senha?'));
+      await tester.tap(find.text('Esqueceu a senha?'));
       await tester.pumpAndSettle();
       await tester.ensureVisible(find.text('Voltar'));
       await tester.tap(find.text('Voltar'));

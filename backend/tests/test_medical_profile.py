@@ -19,7 +19,7 @@ def _login(client, cpf: str, password: str) -> dict[str, str]:
 
 def _setup_medical_flow() -> tuple[int, int]:
     with SessionLocal() as db:
-        specialty = Specialty(nome="Clínica Geral", ativo=True)
+        specialty = db.scalar(select(Specialty).where(Specialty.nome == "Clínica Geral"))
         doctor = User(
             nome="Doutor Médico",
             cpf="11144477735",
@@ -54,7 +54,7 @@ def _setup_medical_flow() -> tuple[int, int]:
             data_nascimento=datetime(1990, 1, 15),
             e_prioridade="geral",
         )
-        db.add_all([specialty, doctor, other_doctor, nurse, patient])
+        db.add_all([doctor, other_doctor, nurse, patient])
         db.flush()
         db.add_all(
             [
@@ -137,6 +137,13 @@ def test_medical_login_queue_and_complete_with_summary(client):
     )
     assert missing.status_code == 422
 
+    whitespace_only = client.patch(
+        f"/medico/atendimentos/{appointment_id}/concluir",
+        headers=headers,
+        json={"summary": "   \t  "},
+    )
+    assert whitespace_only.status_code == 422
+
     completed = client.patch(
         f"/medico/atendimentos/{appointment_id}/concluir",
         headers=headers,
@@ -203,7 +210,7 @@ def test_patient_cannot_be_in_two_simultaneous_medical_visits(client):
             especialidade="Clínica Geral",
             data_horario=datetime.now().replace(hour=11, minute=0, second=0, microsecond=0),
             status="em_triagem",
-            classificacao_risco="medio",
+            classificacao_risco="moderado",
             chegada_em=datetime.now(),
             triagem_em=datetime.now(),
             triagem_por=nurse.id,
@@ -214,7 +221,7 @@ def test_patient_cannot_be_in_two_simultaneous_medical_visits(client):
             RiskClassification(
                 consulta_id=second.id,
                 profissional_id=nurse.id,
-                nivel_risco="medio",
+                nivel_risco="moderado",
                 queixa_principal="Segunda queixa fictícia.",
                 sinais_vitais="Sinais vitais fictícios.",
             )
@@ -300,7 +307,7 @@ def test_legacy_professional_migration_preserves_ids_and_links(client):
     with SessionLocal() as db:
         legacy = User(
             nome="Médico Legado",
-            cpf="11144477735",
+            cpf="45678912364",
             email="legado@ubs.local",
             senha_hash=pwd.hash("Medico@123"),
             perfil="profissional",

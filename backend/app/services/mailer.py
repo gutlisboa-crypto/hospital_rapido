@@ -1,7 +1,6 @@
 """Entrega SMTP com TLS; códigos e credenciais nunca são registrados."""
 
 import logging
-from datetime import datetime, timezone
 import os
 import socket
 import smtplib
@@ -9,6 +8,7 @@ import ssl
 from email.message import EmailMessage
 from email.utils import formataddr
 from email_validator import validate_email, EmailNotValidError
+from app.core import clock
 
 logger = logging.getLogger(__name__)
 
@@ -71,8 +71,24 @@ def _log_failure(reason, *, error_type="none", details="none"):
         reason,
         error_type,
         details,
-        datetime.now(timezone.utc).isoformat(),
+        clock.now_utc().isoformat(),
     )
+
+
+def _authenticate(smtp, user, password):
+    """Use one advertised mechanism so an authentication error is not masked.
+
+    ``smtplib.login`` may try a second mechanism after an explicit 535 response.
+    Some providers close that second attempt, turning the useful authentication
+    error into a generic ``SMTPServerDisconnected`` exception.
+    """
+    advertised = getattr(smtp, "esmtp_features", {}).get("auth", "")
+    mechanisms = {item.upper() for item in advertised.split()}
+    if "LOGIN" in mechanisms and hasattr(smtp, "auth_login"):
+        smtp.user = user
+        smtp.password = password
+        return smtp.auth("LOGIN", smtp.auth_login, initial_response_ok=False)
+    return smtp.login(user, password)
 
 
 def _send_code(email, code, *, subject, heading, purpose, html):
@@ -129,7 +145,7 @@ def _send_code(email, code, *, subject, heading, purpose, html):
                 smtp.ehlo()
                 smtp.starttls(context=context)
                 smtp.ehlo()
-            smtp.login(user, password)
+            _authenticate(smtp, user, password)
             # Contas desconhecidas percorrem a mesma verificação de disponibilidade.
             if email is None:
                 return
@@ -162,7 +178,7 @@ def _send_code(email, code, *, subject, heading, purpose, html):
                 raise MailUnavailable("SMTP_RECIPIENT_REFUSED")
         logger.info(
             "email_delivery status=accepted code=SMTP_ACCEPTED timestamp=%s",
-            datetime.now(timezone.utc).isoformat(),
+            clock.now_utc().isoformat(),
         )
     except MailUnavailable as error:
         _log_failure(error.reason, details=error.details or "none")

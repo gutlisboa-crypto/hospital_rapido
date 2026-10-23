@@ -6,7 +6,7 @@
 - **Perfil:** enfermagem autorizada.
 - **Filtros:** data, especialidade, status e classificação.
 - **Botões:** atualizar, detalhes, classificar/reclassificar risco e sair.
-- **Diálogo:** nível (muito alto, alto, médio ou baixo), queixa principal e sinais vitais obrigatórios, além de observação curta opcional.
+- **Diálogo:** nível (muito alto, alto, moderado ou baixo), queixa principal e sinais vitais obrigatórios, além de observação curta opcional.
 - **Validações:** exige check-in, estado compatível e autorização ativa.
 - **Frontend:** `frontend/lib/screens/staff_dashboard.dart` (`StaffDashboard`, `_RiskDialog`).
 - **API:** `GET /enfermagem/resumo`, `/fila`, `/agendamentos/{id}`; `PATCH .../classificacao-risco`.
@@ -19,4 +19,4 @@
 - **Botões:** atualizar, detalhes, chamar/chamar novamente, iniciar, concluir e sair.
 - **Validações:** consulta deve pertencer ao profissional; início exige check-in e classificação; conclusão exige atendimento em andamento.
 - **Frontend:** `frontend/lib/screens/staff_dashboard.dart`.
-- **API:** `GET /profissional/fila`, `/agendamentos/{id}`; `PATCH .../chamar`, `/iniciar-atendimento` e `/concluir-atendimento`.
+- **API médica oficial:** `GET /medico/fila`, `/medico/atendimentos/{id}`; `PATCH .../chamar`, `/iniciar` e `/concluir`.

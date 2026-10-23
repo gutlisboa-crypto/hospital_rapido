@@ -8,36 +8,24 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.core import clock
+from app.core.risk import RISK_LABELS
+from app.core.specialty import canonical_specialty_name
 from app.core.security import require_roles
 from app.models import Appointment, AppointmentStatusHistory, RiskClassification, User
 from app.schemas import MedicalCareResponse, MedicalCompletion
 from app.services.appointments import (
+    full_age,
     legal_priority_code,
     legal_priority_label,
     queue_sort_key,
+    record_audit_event,
 )
 
 router = APIRouter(prefix="/medico", tags=["medico"])
 
-RISK_LABELS = {
-    "muito_alto": "Muito alto",
-    "vermelho": "Muito alto",
-    "alto": "Alto",
-    "laranja": "Alto",
-    "medio": "Médio",
-    "amarelo": "Médio",
-    "baixo": "Baixo",
-    "verde": "Baixo",
-    "azul": "Baixo",
-}
-
-
 def _age(patient: User) -> int | None:
-    if not patient.data_nascimento:
-        return None
-    born = patient.data_nascimento.date()
-    today = date.today()
-    return today.year - born.year - ((today.month, today.day) < (born.month, born.day))
+    return full_age(patient.data_nascimento) if patient.data_nascimento else None
 
 
 def _risk(db: Session, appointment_id: int) -> RiskClassification | None:
@@ -78,7 +66,7 @@ def _payload(db: Session, row: Appointment) -> dict:
         "scheduled_at": row.data_horario,
         "patient": row.paciente.nome,
         "age": _age(row.paciente),
-        "specialty": row.especialidade,
+        "specialty": canonical_specialty_name(row.especialidade),
         "professional": row.medico.nome,
         "professional_id": row.medico_id,
         "status": row.status,
@@ -91,6 +79,7 @@ def _payload(db: Session, row: Appointment) -> dict:
         "triage_observation": risk.observacao,
         "arrived_at": row.chegada_em,
         "triaged_at": row.triagem_em,
+        "called_at": row.chamado_em,
         "started_at": row.iniciado_em,
         "completed_at": row.concluido_em,
         "care_summary": row.resumo_atendimento,
@@ -102,7 +91,7 @@ def medical_queue(
     actor: User = Depends(require_roles("medico")),
     db: Session = Depends(get_db),
 ):
-    start = datetime.combine(date.today(), time.min)
+    start = datetime.combine(clock.today_sao_paulo(), time.min)
     end = start + timedelta(days=1)
     rows = list(
         db.scalars(
@@ -137,6 +126,21 @@ def medical_details(
     return _payload(db, row)
 
 
+@router.patch("/atendimentos/{appointment_id}/chamar", response_model=MedicalCareResponse)
+def call_medical_patient(
+    appointment_id: int,
+    actor: User = Depends(require_roles("medico")),
+    db: Session = Depends(get_db),
+):
+    row = _authorized_row(db, appointment_id, actor)
+    _ensure_triaged(db, row)
+    if row.status != "em_triagem":
+        raise HTTPException(409, "Somente paciente aguardando Médico pode ser chamado")
+    row.chamado_em = clock.now_sao_paulo_naive()
+    db.commit()
+    return _payload(db, row)
+
+
 @router.patch("/atendimentos/{appointment_id}/iniciar", response_model=MedicalCareResponse)
 def start_medical_care(
     appointment_id: int,
@@ -156,7 +160,7 @@ def start_medical_care(
     )
     if concurrent:
         raise HTTPException(409, "Paciente já está em atendimento com outro Médico")
-    now = datetime.now()
+    now = clock.now_sao_paulo_naive()
     row.iniciado_em = now
     row.atendimento_medico_id = actor.id
     row.status = "em_atendimento"
@@ -168,6 +172,9 @@ def start_medical_care(
             alterado_por=actor.id,
         )
     )
+    record_audit_event(db, actor, "atendimento_iniciado", "consulta", row.id, {
+        "status_anterior": "em_triagem", "status_novo": "em_atendimento",
+    })
     try:
         db.commit()
     except IntegrityError:
@@ -190,7 +197,7 @@ def complete_medical_care(
     if row.atendimento_medico_id != actor.id:
         raise HTTPException(403, "Somente o Médico que iniciou pode concluir o atendimento")
     row.resumo_atendimento = payload.summary
-    row.concluido_em = datetime.now()
+    row.concluido_em = clock.now_sao_paulo_naive()
     row.status = "concluido"
     db.add(
         AppointmentStatusHistory(
@@ -200,5 +207,8 @@ def complete_medical_care(
             alterado_por=actor.id,
         )
     )
+    record_audit_event(db, actor, "atendimento_concluido", "consulta", row.id, {
+        "status_anterior": "em_atendimento", "status_novo": "concluido",
+    })
     db.commit()
     return _payload(db, row)

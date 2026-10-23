@@ -20,3 +20,7 @@
 - **Validações:** formato de e-mail, código temporário/uso único e política de senha forte.
 - **Frontend:** `frontend/lib/screens/recovery_email_page.dart` (`RecoveryPage`).
 - **API:** `POST /auth/esqueci-senha`, `/auth/validar-codigo-recuperacao` e `/auth/redefinir-senha`.
+- **Privacidade:** a solicitação sempre usa mensagem genérica e não revela se o e-mail está cadastrado.
+- **Segurança:** código aleatório de seis dígitos armazenado somente como hash, validade de 10 minutos, cinco tentativas, uso único e intervalo mínimo de 60 segundos entre envios.
+- **Decisão de escopo:** a recuperação digital por e-mail faz parte do produto atual; a decisão histórica que a retirava do escopo não descreve mais a versão operacional.
+- **Acessibilidade:** os campos possuem rótulos obrigatórios, erros são regiões anunciáveis e o fluxo aceita navegação por teclado no Windows.
